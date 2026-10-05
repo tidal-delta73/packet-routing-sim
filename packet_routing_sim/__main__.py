@@ -6,6 +6,7 @@ import sys
 from . import __version__
 
 COMPUTE_USAGE = "usage: python3 -m packet_routing_sim compute TOPOLOGY.json"
+CONVERGE_USAGE = "usage: python3 -m packet_routing_sim converge TOPOLOGY.json"
 
 USAGE = """usage: python3 -m packet_routing_sim <command>
 
@@ -13,6 +14,8 @@ commands:
   version                       print the package version
   compute TOPOLOGY.json         compute shortest-path forwarding tables
                                 from a static undirected topology
+  converge TOPOLOGY.json        show distance-vector convergence round
+                                by round from a static undirected topology
   help                          print this message
 """
 
@@ -97,7 +100,12 @@ def forwarding_table(source, ordered_nodes, adjacency):
     return table
 
 
-def run_compute(path):
+def load_topology(path):
+    """Read and validate the topology at path.
+
+    Returns (nodes, adjacency), or an exit code (2) after reporting the
+    matching error if the file cannot be read, parsed, or validated.
+    """
     try:
         with open(path, "rb") as stream:
             raw = stream.read()
@@ -115,6 +123,13 @@ def run_compute(path):
     if parsed is None:
         print("invalid topology", file=sys.stderr)
         return 2
+    return parsed
+
+
+def run_compute(path):
+    parsed = load_topology(path)
+    if isinstance(parsed, int):
+        return parsed
     nodes, adjacency = parsed
 
     ordered_nodes = sorted(nodes)
@@ -124,6 +139,79 @@ def run_compute(path):
     }
     output = json.dumps({"routers": routers}, indent=2, ensure_ascii=False)
     sys.stdout.write(output + "\n")
+    return 0
+
+
+def initial_distance_vectors(ordered_nodes, adjacency):
+    """Round 0: each router knows only itself and its directly connected links."""
+    vectors = {}
+    for router in ordered_nodes:
+        table = {}
+        for destination in ordered_nodes:
+            if destination == router:
+                table[destination] = {"nextHop": None, "metric": 0}
+            elif destination in adjacency[router]:
+                table[destination] = {
+                    "nextHop": destination,
+                    "metric": adjacency[router][destination],
+                }
+            else:
+                table[destination] = {"nextHop": None, "metric": None}
+        vectors[router] = table
+    return vectors
+
+
+def distance_vector_round(previous, ordered_nodes, adjacency):
+    """Synchronously update every router from the previous round's advertisements."""
+    current = {}
+    for router in ordered_nodes:
+        table = {}
+        for destination in ordered_nodes:
+            if destination == router:
+                table[destination] = {"nextHop": None, "metric": 0}
+                continue
+            best_metric = None
+            best_hop = None
+            for neighbor in sorted(adjacency[router]):
+                advertised = previous[neighbor][destination]
+                if advertised["metric"] is None:
+                    continue
+                candidate = adjacency[router][neighbor] + advertised["metric"]
+                # Neighbors are iterated in name order, so the first best
+                # candidate keeps the smaller next-hop name on ties.
+                if best_metric is None or candidate < best_metric:
+                    best_metric = candidate
+                    best_hop = neighbor
+            if best_metric is None:
+                table[destination] = {"nextHop": None, "metric": None}
+            else:
+                table[destination] = {"nextHop": best_hop, "metric": best_metric}
+        current[router] = table
+    return current
+
+
+def run_converge(path):
+    parsed = load_topology(path)
+    if isinstance(parsed, int):
+        return parsed
+    nodes, adjacency = parsed
+
+    ordered_nodes = sorted(nodes)
+    vectors = initial_distance_vectors(ordered_nodes, adjacency)
+    rounds = [{"round": 0, "routers": vectors}]
+    while True:
+        updated = distance_vector_round(vectors, ordered_nodes, adjacency)
+        if updated == vectors:
+            break
+        vectors = updated
+        rounds.append({"round": len(rounds), "routers": vectors})
+
+    output = {
+        "protocol": "distance-vector",
+        "convergenceRound": rounds[-1]["round"],
+        "rounds": rounds,
+    }
+    sys.stdout.write(json.dumps(output, indent=2, ensure_ascii=False) + "\n")
     return 0
 
 
@@ -138,6 +226,11 @@ def main(argv: list[str] | None = None) -> int:
             print(COMPUTE_USAGE, file=sys.stderr)
             return 2
         return run_compute(args[1])
+    if command == "converge":
+        if len(args) != 2:
+            print(CONVERGE_USAGE, file=sys.stderr)
+            return 2
+        return run_converge(args[1])
     if command in {"help", "-h", "--help"}:
         print(USAGE, end="")
         return 0
