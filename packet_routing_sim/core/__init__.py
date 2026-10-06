@@ -7,6 +7,8 @@ Public entry points:
 * :func:`replay_scenario`     -> ``{"protocol", "timeline"}`` (link-state)
 * :func:`replay_dv_scenario`  -> ``{"protocol", "infinityMetric",
   "timeline"}`` (distance-vector)
+* :func:`replay_ls_scenario`  -> ``{"protocol", "timeline"}`` with auditable
+  link-state neighbor discovery, LSA flooding and per-round SPF
 
 Each entry point takes already-decoded JSON values (plain ``dict``/``list``/
 ``str``/``int``) and returns fresh plain-Python data.  The core performs no
@@ -40,10 +42,12 @@ from .routing import (
     distance_vector_failure_round_zero,
     forwarding_table,
     initial_distance_vectors,
+    link_state_baseline_rounds,
+    link_state_event_rounds,
     link_state_snapshot,
 )
 from .scenario import validate_dv_scenario, validate_scenario
-from .state import NetworkState, apply_event
+from .state import NODE_UP, NetworkState, apply_event
 from .topology import Topology, validate_topology
 
 __all__ = [
@@ -53,6 +57,8 @@ __all__ = [
     "replay_validated",
     "replay_dv_scenario",
     "replay_dv_validated",
+    "replay_ls_scenario",
+    "replay_ls_validated",
     "snapshot_state",
     "validate_topology",
     "validate_scenario",
@@ -208,3 +214,69 @@ def replay_dv_scenario(topology, scenario):
     state and neither reads nor retains state from a previous call.
     """
     return replay_dv_validated(_validated(topology), scenario)
+
+
+def replay_ls_validated(topo, scenario):
+    """Auditable link-state failure timeline from a validated topology.
+
+    Mirrors :func:`replay_validated` so the command layer enforces
+    topology-before-scenario precedence; only the scenario is validated
+    here.  The result is ``{"protocol": "link-state", "timeline": ...}``
+    where the baseline entry (``event: null``) shows neighbor discovery and
+    flooding from the fault-free state, and each later entry echoes
+    ``time`` and the raw event verbatim around a fresh round-0/flooding
+    phase that inherits the previous entry's converged databases.
+    """
+    events = validate_scenario(topo, copy.deepcopy(scenario))
+
+    ordered_nodes = topo.nodes
+    state = NetworkState.initial(topo)
+    active_adjacency = state.active_adjacency()
+    rounds, databases, sequence_numbers = link_state_baseline_rounds(
+        ordered_nodes, active_adjacency
+    )
+    timeline = [
+        {
+            "event": None,
+            "convergenceRound": rounds[-1]["round"],
+            "rounds": rounds,
+        }
+    ]
+
+    previous_adjacency = active_adjacency
+    for event in events:
+        # A node-up is the one event whose endpoint restarts with an empty
+        # database while continuing its historical sequence numbers.
+        recovered_nodes = (event.node,) if event.action == NODE_UP else ()
+        state = apply_event(state, event)
+        active_adjacency = state.active_adjacency()
+        rounds, databases, sequence_numbers = link_state_event_rounds(
+            databases,
+            sequence_numbers,
+            ordered_nodes,
+            previous_adjacency,
+            active_adjacency,
+            state.down_nodes,
+            recovered_nodes,
+        )
+        timeline.append(
+            {
+                "time": event.time,
+                "event": event.raw,
+                "convergenceRound": rounds[-1]["round"],
+                "rounds": rounds,
+            }
+        )
+        previous_adjacency = active_adjacency
+    return {"protocol": "link-state", "timeline": timeline}
+
+
+def replay_ls_scenario(topology, scenario):
+    """Auditable link-state timeline for a decoded topology and scenario.
+
+    Every call starts from the fault-free state: round 0 discovers direct
+    neighbors and originates sequence-1 LSAs, and each event phase inherits
+    the prior phase's converged link-state databases rather than any state
+    left behind by another call.
+    """
+    return replay_ls_validated(_validated(topology), scenario)

@@ -1,4 +1,5 @@
-"""Command line entry point: version, compute, converge, replay, replay-dv and help.
+"""Command line entry point: version, compute, converge, replay, replay-dv,
+replay-ls and help.
 
 This layer contains only argument checking, file reading, JSON parsing and
 JSON serialization.  All topology validation, protocol computation and
@@ -15,6 +16,7 @@ from .core import (
     compute_topology,
     converge_topology,
     replay_dv_validated,
+    replay_ls_validated,
     replay_validated,
     validate_topology,
 )
@@ -26,6 +28,9 @@ REPLAY_USAGE = (
 )
 REPLAY_DV_USAGE = (
     "usage: python3 -m packet_routing_sim replay-dv TOPOLOGY.json SCENARIO.json"
+)
+REPLAY_LS_USAGE = (
+    "usage: python3 -m packet_routing_sim replay-ls TOPOLOGY.json SCENARIO.json"
 )
 
 USAGE = """usage: python3 -m packet_routing_sim <command>
@@ -168,6 +173,37 @@ def run_replay_dv(topology_path, scenario_path):
     return 0
 
 
+def run_replay_ls(topology_path, scenario_path):
+    """Auditable link-state replay: identical file/error conventions."""
+    topology = _read_json(
+        topology_path,
+        "cannot read topology: {path}",
+        "invalid topology",
+    )
+    if topology is _READ_FAILED:
+        return 2
+    try:
+        topo = validate_topology(topology)
+    except InvalidTopology:
+        print("invalid topology", file=sys.stderr)
+        return 2
+
+    scenario = _read_json(
+        scenario_path,
+        "cannot read scenario: {path}",
+        "invalid scenario",
+    )
+    if scenario is _READ_FAILED:
+        return 2
+    try:
+        result = replay_ls_validated(topo, scenario)
+    except InvalidScenario:
+        print("invalid scenario", file=sys.stderr)
+        return 2
+    _emit(result)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     command = args[0] if args else "help"
@@ -194,6 +230,11 @@ def main(argv: list[str] | None = None) -> int:
             print(REPLAY_DV_USAGE, file=sys.stderr)
             return 2
         return run_replay_dv(args[1], args[2])
+    if command == "replay-ls":
+        if len(args) != 3:
+            print(REPLAY_LS_USAGE, file=sys.stderr)
+            return 2
+        return run_replay_ls(args[1], args[2])
     if command in {"help", "-h", "--help"}:
         print(USAGE, end="")
         return 0

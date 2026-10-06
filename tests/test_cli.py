@@ -35,6 +35,9 @@ REPLAY_USAGE = (
 REPLAY_DV_USAGE = (
     "usage: python3 -m packet_routing_sim replay-dv TOPOLOGY.json SCENARIO.json\n"
 )
+REPLAY_LS_USAGE = (
+    "usage: python3 -m packet_routing_sim replay-ls TOPOLOGY.json SCENARIO.json\n"
+)
 USAGE = """usage: python3 -m packet_routing_sim <command>
 
 commands:
@@ -1410,6 +1413,227 @@ class TestReplayDVInvalidScenarios(unittest.TestCase):
                 self.assertEqual(proc.returncode, 2)
                 self.assertEqual(proc.stdout, b"")
                 self.assertEqual(proc.stderr, REPLAY_DV_USAGE.encode())
+
+
+# ---------------------------------------------------------------------------
+# replay-ls: auditable link-state flooding timeline, errors
+# ---------------------------------------------------------------------------
+
+
+def invoke_replay_ls(directory, topology, scenario, seed=0):
+    topo_path = write_topology(directory, topology)
+    scenario_path = write_scenario(directory, scenario)
+    return run_cli(
+        ["replay-ls", str(topo_path), str(scenario_path)], seed=seed
+    )
+
+
+class TestReplayLS(unittest.TestCase):
+    def test_envelope_and_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_ls(tmp, CHAIN3, {"events": []})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stderr, b"")
+            result = json.loads(proc.stdout)
+            self.assertEqual(set(result), {"protocol", "timeline"})
+            self.assertEqual(result["protocol"], "link-state")
+            baseline = result["timeline"][0]
+            self.assertEqual(
+                set(baseline), {"event", "convergenceRound", "rounds"}
+            )
+            self.assertIsNone(baseline["event"])
+            self.assertEqual(
+                [r["round"] for r in baseline["rounds"]], [0, 1, 2]
+            )
+            self.assertEqual(baseline["convergenceRound"], 2)
+            for snapshot in baseline["rounds"]:
+                self.assertEqual(set(snapshot), {"round", "databases", "routers"})
+            # The converged round reproduces compute's forwarding tables.
+            compute = json.loads(
+                run_cli(
+                    ["compute", str(write_topology(tmp, CHAIN3, "t.json"))]
+                ).stdout
+            )
+            self.assertEqual(
+                baseline["rounds"][-1]["routers"], compute["routers"]
+            )
+
+    def test_event_entries_echo_time_and_event(self):
+        events = [
+            {"time": 3, "action": "link-down", "from": "A", "to": "B"},
+            {"time": 9, "action": "node-down", "node": "C"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_ls(tmp, DIAMOND, {"events": events})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            timeline = json.loads(proc.stdout)["timeline"]
+            self.assertEqual(len(timeline), 3)
+            for index, event in enumerate(events, start=1):
+                self.assertEqual(
+                    set(timeline[index]),
+                    {"time", "event", "convergenceRound", "rounds"},
+                )
+                self.assertEqual(timeline[index]["time"], event["time"])
+                self.assertEqual(timeline[index]["event"], event)
+
+    def test_round_zero_discovery_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_ls(tmp, CHAIN3, {"events": []})
+            round_zero = json.loads(proc.stdout)["timeline"][0]["rounds"][0]
+            self.assertEqual(
+                round_zero["databases"],
+                {
+                    "A": {"A": {"seq": 1, "neighbors": [
+                        {"router": "B", "metric": 5}]}},
+                    "B": {"B": {"seq": 1, "neighbors": [
+                        {"router": "A", "metric": 5},
+                        {"router": "C", "metric": 7}]}},
+                    "C": {"C": {"seq": 1, "neighbors": [
+                        {"router": "B", "metric": 7}]}},
+                },
+            )
+            for router in ("A", "B", "C"):
+                row = round_zero["routers"][router]
+                for dest in ("A", "B", "C"):
+                    if router == dest:
+                        self.assertEqual(
+                            row[dest], {"nextHop": None, "metric": 0}
+                        )
+                    else:
+                        self.assertEqual(
+                            row[dest], {"nextHop": None, "metric": None}
+                        )
+
+    def test_down_router_row_is_null_but_database_is_frozen(self):
+        scenario = {
+            "events": [{"time": 1, "action": "node-down", "node": "B"}]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_ls(tmp, CHAIN3, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            entry = json.loads(proc.stdout)["timeline"][1]
+            for snapshot in entry["rounds"]:
+                self.assertIsNone(snapshot["routers"]["B"])
+            frozen = entry["rounds"][0]["databases"]["B"]
+            self.assertEqual(set(frozen), {"A", "B", "C"})
+            # The down node originates nothing new: its own LSA stays seq 1.
+            self.assertEqual(frozen["B"]["seq"], 1)
+
+    def test_empty_topology_and_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_ls(tmp, EMPTY, {"events": []})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                json.loads(proc.stdout),
+                {
+                    "protocol": "link-state",
+                    "timeline": [
+                        {
+                            "event": None,
+                            "convergenceRound": 0,
+                            "rounds": [
+                                {"round": 0, "databases": {}, "routers": {}}
+                            ],
+                        }
+                    ],
+                },
+            )
+
+    def test_byte_identity_across_seeds_and_declaration_order(self):
+        scenario = {"events": list(REPLAY_SCENARIO)}
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs = set()
+            for seed in HASH_SEEDS:
+                for index, variant in enumerate(EQUIVALENT_VARIANTS):
+                    topo_path = write_topology(tmp, variant, f"v{index}.json")
+                    scen_path = write_scenario(
+                        tmp, scenario, f"s{index}.json"
+                    )
+                    proc = run_cli(
+                        ["replay-ls", str(topo_path), str(scen_path)],
+                        seed=seed,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(proc.stderr, b"")
+                    outputs.add(proc.stdout)
+            self.assertEqual(len(outputs), 1)
+
+
+class TestReplayLSInvalidScenarios(unittest.TestCase):
+    def _assert_invalid(self, directory, scenario):
+        proc = invoke_replay_ls(directory, CHAIN3, scenario)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(proc.stderr, b"invalid scenario\n")
+
+    def test_invalid_scenarios(self):
+        node_down = {"time": 1, "action": "node-down", "node": "A"}
+        link_down = {"time": 1, "action": "link-down", "from": "A", "to": "B"}
+        invalid = [
+            [], "just a string", 42, {},
+            {"events": {}}, {"events": "x"}, {"events": ["x"]},
+            {"events": [None]},
+            {"events": [{"action": "node-down", "node": "A"}]},
+            {"events": [{"time": 1}]},
+            {"events": [{"time": 1, "action": "explode", "node": "A"}]},
+            {"events": [{"time": 0, "action": "node-down", "node": "A"}]},
+            {"events": [dict(node_down, node="ZZ")]},
+            {"events": [dict(link_down, **{"from": "A", "to": "C"})]},
+            {"events": [dict(node_down, time=2), dict(link_down, time=2)]},
+            # Illegal transitions share replay's message and status.
+            {"events": [{"time": 1, "action": "node-up", "node": "A"}]},
+            {"events": [{"time": 1, "action": "link-up",
+                         "from": "A", "to": "B"}]},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, scenario in enumerate(invalid):
+                with self.subTest(case=index):
+                    self._assert_invalid(tmp, scenario)
+
+    def test_unreadable_and_unparseable_scenario(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            topo_path = write_topology(tmp, CHAIN3)
+            missing = str(Path(tmp) / "nope.json")
+            proc = run_cli(["replay-ls", str(topo_path), missing])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(
+                proc.stderr, f"cannot read scenario: {missing}\n".encode()
+            )
+            broken = Path(tmp) / "broken.json"
+            broken.write_text("{bad", encoding="utf-8")
+            proc = run_cli(["replay-ls", str(topo_path), str(broken)])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(proc.stderr, b"invalid scenario\n")
+
+    def test_topology_errors_take_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_topo = str(Path(tmp) / "missing.json")
+            proc = run_cli(["replay-ls", missing_topo, "also-missing.json"])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(
+                proc.stderr, f"cannot read topology: {missing_topo}\n".encode()
+            )
+            bad_topo = write_topology(tmp, {"nodes": ["A", "A"], "links": []})
+            scen = write_scenario(tmp, {"events": []})
+            proc = run_cli(["replay-ls", str(bad_topo), str(scen)])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(proc.stderr, b"invalid topology\n")
+
+    def test_argument_count_errors(self):
+        for args in (
+            ["replay-ls"],
+            ["replay-ls", "a.json"],
+            ["replay-ls", "a.json", "b.json", "c.json"],
+        ):
+            with self.subTest(args=args):
+                proc = run_cli(args)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, b"")
+                self.assertEqual(proc.stderr, REPLAY_LS_USAGE.encode())
 
 
 # ---------------------------------------------------------------------------
