@@ -29,6 +29,9 @@ HASH_SEEDS = tuple(
 VERSION = "0.1.0"
 COMPUTE_USAGE = "usage: python3 -m packet_routing_sim compute TOPOLOGY.json\n"
 CONVERGE_USAGE = "usage: python3 -m packet_routing_sim converge TOPOLOGY.json\n"
+REPLAY_USAGE = (
+    "usage: python3 -m packet_routing_sim replay TOPOLOGY.json SCENARIO.json\n"
+)
 USAGE = """usage: python3 -m packet_routing_sim <command>
 
 commands:
@@ -667,6 +670,341 @@ class TestConvergenceTrajectory(unittest.TestCase):
             c4 = json.loads(run_cli(["converge", str(write_topology(tmp, CHAIN4, "c4.json"))]).stdout)
             self.assertEqual(c3["convergenceRound"], 1)
             self.assertEqual(c4["convergenceRound"], 2)
+
+
+# ---------------------------------------------------------------------------
+# Replay: independent oracle and scenario helpers
+# ---------------------------------------------------------------------------
+
+def replay_oracle_routers(topology, down_nodes, down_links):
+    """Expected {(router, destination): (nextHop, metric)} after failures.
+
+    Written independently of the SUT: Floyd-Warshall over the subgraph of
+    active nodes and links, with down routers' rows and down or unreachable
+    destinations forced to (None, None).
+    """
+    nodes, adjacency = build_adjacency(topology)
+    disabled = {frozenset(pair) for pair in down_links}
+    active = {node: {} for node in nodes}
+    for source in nodes:
+        if source in down_nodes:
+            continue
+        for target, metric in adjacency[source].items():
+            if target in down_nodes or frozenset((source, target)) in disabled:
+                continue
+            active[source][target] = metric
+    dist = floyd_warshall(nodes, active)
+    expected = {}
+    for source in nodes:
+        for dest in nodes:
+            if source in down_nodes:
+                expected[source, dest] = (None, None)
+            elif source == dest:
+                expected[source, dest] = (None, 0)
+            elif dest in down_nodes or dist[source][dest] == float("inf"):
+                expected[source, dest] = (None, None)
+            else:
+                winners = [
+                    neighbor
+                    for neighbor in active[source]
+                    if active[source][neighbor] + dist[neighbor][dest]
+                    == dist[source][dest]
+                ]
+                expected[source, dest] = (min(winners), dist[source][dest])
+    return expected
+
+
+def write_scenario(directory, scenario, name="scenario.json"):
+    path = Path(directory) / name
+    path.write_text(json.dumps(scenario), encoding="utf-8")
+    return path
+
+
+def invoke_replay(directory, topology, scenario, seed=0):
+    topo_path = write_topology(directory, topology)
+    scenario_path = write_scenario(directory, scenario)
+    return run_cli(
+        ["replay", str(topo_path), str(scenario_path)], seed=seed
+    )
+
+
+# Exercises every action plus the independent tracking of link-down state:
+# the C-D link is disabled while C is down, so C's recovery must not revive
+# it, and the reversed-direction link-up must clear exactly that record.
+REPLAY_SCENARIO = [
+    {"time": 3, "action": "link-down", "from": "A", "to": "B"},
+    {"time": 5, "action": "node-down", "node": "C"},
+    {"time": 8, "action": "link-down", "from": "D", "to": "C"},
+    {"time": 9, "action": "node-up", "node": "C"},
+    {"time": 12, "action": "link-up", "from": "C", "to": "D"},
+    {"time": 15, "action": "link-up", "from": "B", "to": "A"},
+]
+
+
+class TestReplay(unittest.TestCase):
+    def _apply(self, event, down_nodes, down_links):
+        action = event["action"]
+        if action == "node-down":
+            down_nodes.add(event["node"])
+        elif action == "node-up":
+            down_nodes.discard(event["node"])
+        else:
+            pair = frozenset((event["from"], event["to"]))
+            if action == "link-down":
+                down_links.add(pair)
+            else:
+                down_links.discard(pair)
+
+    def test_timeline_matches_oracle_step_by_step(self):
+        for name, topology, _ in ALL_TOPOLOGIES:
+            nodes = topology["nodes"]
+            if not nodes:
+                continue
+            # Drive every fixture through the same scenario shape: disable a
+            # declared link and a node, then recover both. Skip fixtures
+            # without the nodes/links the shared scenario references.
+            with self.subTest(topology=name), tempfile.TemporaryDirectory() as tmp:
+                scenario = []
+                down_nodes, down_links = set(), set()
+                time = 1
+                if topology["links"]:
+                    first = topology["links"][0]
+                    scenario.append(
+                        {"time": time, "action": "link-down",
+                         "from": first["from"], "to": first["to"]}
+                    )
+                    time += 1
+                victim = nodes[0]
+                scenario.append({"time": time, "action": "node-down", "node": victim})
+                time += 1
+                scenario.append({"time": time, "action": "node-up", "node": victim})
+                time += 1
+                if topology["links"]:
+                    first = topology["links"][0]
+                    scenario.append(
+                        {"time": time, "action": "link-up",
+                         "from": first["to"], "to": first["from"]}
+                    )
+                proc = invoke_replay(tmp, topology, {"events": scenario})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stderr, b"")
+                replay = json.loads(proc.stdout)
+                self.assertEqual(set(replay), {"protocol", "timeline"})
+                self.assertEqual(replay["protocol"], "link-state")
+                timeline = replay["timeline"]
+                self.assertEqual(len(timeline), len(scenario) + 1)
+
+                self.assertEqual(set(timeline[0]), {"event", "routers"})
+                self.assertIsNone(timeline[0]["event"])
+                for index, event in enumerate(scenario, start=1):
+                    entry = timeline[index]
+                    self.assertEqual(set(entry), {"time", "event", "routers"})
+                    self.assertEqual(entry["time"], event["time"])
+                    self.assertEqual(entry["event"], event)
+
+                for index, entry in enumerate(timeline):
+                    if index > 0:
+                        self._apply(scenario[index - 1], down_nodes, down_links)
+                    self.assertEqual(
+                        normalize(entry["routers"]),
+                        replay_oracle_routers(topology, down_nodes, down_links),
+                        f"{name} timeline[{index}]",
+                    )
+
+    def test_baseline_equals_compute_and_key_order_is_sorted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay(tmp, DIAMOND, {"events": REPLAY_SCENARIO})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            replay = json.loads(proc.stdout)
+            compute = json.loads(
+                run_cli(["compute", str(write_topology(tmp, DIAMOND, "t2.json"))]).stdout
+            )
+            self.assertEqual(replay["timeline"][0]["routers"], compute["routers"])
+            nodes = sorted(DIAMOND["nodes"])
+            for entry in replay["timeline"]:
+                self.assertEqual(list(entry["routers"]), nodes)
+                for row in entry["routers"].values():
+                    self.assertEqual(list(row), nodes)
+
+    def test_down_router_row_and_down_destination_are_null(self):
+        scenario = {"events": [{"time": 4, "action": "node-down", "node": "B"}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay(tmp, CHAIN3, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            routers = json.loads(proc.stdout)["timeline"][1]["routers"]
+            for dest in ("A", "B", "C"):
+                self.assertEqual(
+                    routers["B"][dest], {"nextHop": None, "metric": None}
+                )
+                self.assertEqual(
+                    routers[dest]["B"], {"nextHop": None, "metric": None}
+                )
+            self.assertEqual(routers["A"]["A"], {"nextHop": None, "metric": 0})
+            # C is now unreachable from A (and vice versa) with B down.
+            self.assertEqual(routers["A"]["C"], {"nextHop": None, "metric": None})
+            self.assertEqual(routers["C"]["A"], {"nextHop": None, "metric": None})
+
+    def test_link_down_state_survives_node_recovery(self):
+        scenario = {
+            "events": [
+                {"time": 1, "action": "link-down", "from": "A", "to": "B"},
+                {"time": 2, "action": "node-down", "node": "B"},
+                {"time": 3, "action": "node-up", "node": "B"},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay(tmp, CHAIN3, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            routers = json.loads(proc.stdout)["timeline"][3]["routers"]
+            # B recovered, but A-B was link-down'd, so A and B stay split.
+            self.assertEqual(routers["A"]["B"], {"nextHop": None, "metric": None})
+            self.assertEqual(routers["A"]["C"], {"nextHop": None, "metric": None})
+            self.assertEqual(routers["B"]["C"], {"nextHop": "C", "metric": 7})
+
+    def test_empty_events_and_byte_identity_across_seeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs = set()
+            for seed in HASH_SEEDS:
+                proc = invoke_replay(tmp, RING, {"events": []}, seed=seed)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stderr, b"")
+                outputs.add(proc.stdout)
+            self.assertEqual(len(outputs), 1)
+            replay = json.loads(outputs.pop())
+            self.assertEqual(len(replay["timeline"]), 1)
+            self.assertIsNone(replay["timeline"][0]["event"])
+
+    def test_full_scenario_byte_identity_across_seeds_and_declaration_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs = set()
+            for seed in HASH_SEEDS:
+                for index, variant in enumerate(EQUIVALENT_VARIANTS):
+                    topo_path = write_topology(tmp, variant, f"v{index}.json")
+                    scen_path = write_scenario(
+                        tmp, {"events": REPLAY_SCENARIO}, f"s{index}.json"
+                    )
+                    proc = run_cli(
+                        ["replay", str(topo_path), str(scen_path)], seed=seed
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    outputs.add(proc.stdout)
+            self.assertEqual(len(outputs), 1)
+
+
+class TestReplayInvalidScenarios(unittest.TestCase):
+    def _assert_invalid(self, directory, scenario):
+        proc = invoke_replay(directory, CHAIN3, scenario)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(proc.stderr, b"invalid scenario\n")
+
+    def test_invalid_scenarios(self):
+        node_down = {"time": 1, "action": "node-down", "node": "A"}
+        link_down = {"time": 1, "action": "link-down", "from": "A", "to": "B"}
+        invalid = [
+            [],
+            "just a string",
+            42,
+            {},
+            {"events": {}},
+            {"events": "x"},
+            {"events": ["x"]},
+            {"events": [None]},
+            # Missing or mistyped fields.
+            {"events": [{"action": "node-down", "node": "A"}]},
+            {"events": [{"time": 1}]},
+            {"events": [{"time": 1, "action": 7, "node": "A"}]},
+            {"events": [{"time": 1, "action": "explode", "node": "A"}]},
+            {"events": [{"time": 1, "action": "node-down"}]},
+            {"events": [{"time": 1, "action": "node-down", "node": 3}]},
+            {"events": [{"time": 1, "action": "link-down", "from": "A"}]},
+            {"events": [{"time": 1, "action": "link-down", "from": "A", "to": 2}]},
+            # Bad times: zero, negative, non-integer, boolean, duplicate,
+            # regressed.
+            {"events": [dict(node_down, time=0)]},
+            {"events": [dict(node_down, time=-2)]},
+            {"events": [dict(node_down, time=1.5)]},
+            {"events": [dict(node_down, time="3")]},
+            {"events": [dict(node_down, time=True)]},
+            {"events": [dict(node_down, time=2), dict(link_down, time=2)]},
+            {"events": [dict(node_down, time=5), dict(link_down, time=3)]},
+            # Unknown objects.
+            {"events": [dict(node_down, node="ZZ")]},
+            {"events": [dict(link_down, to="ZZ")]},
+            {"events": [dict(link_down, **{"from": "A", "to": "C"})]},  # no link
+            {"events": [dict(link_down, **{"from": "A", "to": "A"})]},  # no link
+            # Illegal transitions.
+            {"events": [{"time": 1, "action": "node-up", "node": "A"}]},
+            {
+                "events": [
+                    dict(node_down, time=1),
+                    dict(node_down, time=2),
+                ]
+            },
+            {"events": [{"time": 1, "action": "link-up", "from": "A", "to": "B"}]},
+            {
+                "events": [
+                    dict(link_down, time=1),
+                    # Reversed direction still names the same link.
+                    dict(link_down, time=2, **{"from": "B", "to": "A"}),
+                ]
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, scenario in enumerate(invalid):
+                with self.subTest(case=index):
+                    self._assert_invalid(tmp, scenario)
+
+    def test_unreadable_scenario(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            topo_path = write_topology(tmp, CHAIN3)
+            missing = str(Path(tmp) / "does-not-exist.json")
+            proc = run_cli(["replay", str(topo_path), missing])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(
+                proc.stderr, f"cannot read scenario: {missing}\n".encode()
+            )
+
+    def test_unparseable_scenario(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            topo_path = write_topology(tmp, CHAIN3)
+            scen_path = Path(tmp) / "broken.json"
+            scen_path.write_text("{not valid json", encoding="utf-8")
+            proc = run_cli(["replay", str(topo_path), str(scen_path)])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(proc.stderr, b"invalid scenario\n")
+
+    def test_topology_errors_take_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_topo = str(Path(tmp) / "missing.json")
+            missing_scen = str(Path(tmp) / "missing2.json")
+            proc = run_cli(["replay", missing_topo, missing_scen])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(
+                proc.stderr, f"cannot read topology: {missing_topo}\n".encode()
+            )
+
+            bad_topo = write_topology(tmp, {"nodes": ["A", "A"], "links": []})
+            scen_path = write_scenario(tmp, {"events": []})
+            proc = run_cli(["replay", str(bad_topo), str(scen_path)])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(proc.stderr, b"invalid topology\n")
+
+    def test_argument_count_errors(self):
+        for args in (
+            ["replay"],
+            ["replay", "a.json"],
+            ["replay", "a.json", "b.json", "c.json"],
+        ):
+            with self.subTest(args=args):
+                proc = run_cli(args)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, b"")
+                self.assertEqual(proc.stderr, REPLAY_USAGE.encode())
 
 
 # ---------------------------------------------------------------------------

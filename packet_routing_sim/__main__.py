@@ -1,4 +1,4 @@
-"""Command line entry point: version, compute and help."""
+"""Command line entry point: version, compute, converge, replay and help."""
 import heapq
 import json
 import sys
@@ -7,6 +7,9 @@ from . import __version__
 
 COMPUTE_USAGE = "usage: python3 -m packet_routing_sim compute TOPOLOGY.json"
 CONVERGE_USAGE = "usage: python3 -m packet_routing_sim converge TOPOLOGY.json"
+REPLAY_USAGE = (
+    "usage: python3 -m packet_routing_sim replay TOPOLOGY.json SCENARIO.json"
+)
 
 USAGE = """usage: python3 -m packet_routing_sim <command>
 
@@ -215,6 +218,150 @@ def run_converge(path):
     return 0
 
 
+def link_pair(source, target):
+    """Canonical undirected key for a link endpoint pair."""
+    return (source, target) if source < target else (target, source)
+
+
+def parse_scenario(scenario, nodes, adjacency):
+    """Return the validated event list for a scenario, or None if invalid.
+
+    Checks structure, field types, references into the original topology,
+    strictly increasing positive integer times, and legal state transitions
+    (no repeated disables, no restores of objects that are not disabled).
+    """
+    if not isinstance(scenario, dict):
+        return None
+    events_raw = scenario.get("events")
+    if not isinstance(events_raw, list):
+        return None
+
+    node_set = set(nodes)
+    link_pairs = set()
+    for source in adjacency:
+        for target in adjacency[source]:
+            link_pairs.add(link_pair(source, target))
+
+    events = []
+    down_nodes = set()
+    down_links = set()
+    last_time = 0
+    for event in events_raw:
+        if not isinstance(event, dict):
+            return None
+        time = event.get("time")
+        action = event.get("action")
+        if isinstance(time, bool) or not isinstance(time, int):
+            return None
+        if time <= 0 or time <= last_time:
+            return None
+        if not isinstance(action, str):
+            return None
+        if action in ("node-down", "node-up"):
+            node = event.get("node")
+            if not isinstance(node, str) or node not in node_set:
+                return None
+            if action == "node-down":
+                if node in down_nodes:
+                    return None
+                down_nodes.add(node)
+            else:
+                if node not in down_nodes:
+                    return None
+                down_nodes.discard(node)
+        elif action in ("link-down", "link-up"):
+            source = event.get("from")
+            target = event.get("to")
+            if not isinstance(source, str) or not isinstance(target, str):
+                return None
+            pair = link_pair(source, target)
+            if pair not in link_pairs:
+                return None
+            if action == "link-down":
+                if pair in down_links:
+                    return None
+                down_links.add(pair)
+            else:
+                if pair not in down_links:
+                    return None
+                down_links.discard(pair)
+        else:
+            return None
+        events.append(event)
+        last_time = time
+    return events
+
+
+def run_replay(topology_path, scenario_path):
+    parsed = load_topology(topology_path)
+    if isinstance(parsed, int):
+        return parsed
+    nodes, adjacency = parsed
+
+    try:
+        with open(scenario_path, "rb") as stream:
+            raw = stream.read()
+    except OSError:
+        print(f"cannot read scenario: {scenario_path}", file=sys.stderr)
+        return 2
+    try:
+        scenario = json.loads(raw)
+    except ValueError:
+        print("invalid scenario", file=sys.stderr)
+        return 2
+    events = parse_scenario(scenario, nodes, adjacency)
+    if events is None:
+        print("invalid scenario", file=sys.stderr)
+        return 2
+
+    ordered_nodes = sorted(nodes)
+    down_nodes = set()
+    down_links = set()
+
+    def current_routers():
+        # A link is usable only while neither endpoint is down and no
+        # link-down (not yet matched by a link-up) disabled it.
+        active = {node: {} for node in ordered_nodes if node not in down_nodes}
+        for source in active:
+            for target, metric in adjacency[source].items():
+                if target not in active:
+                    continue
+                if link_pair(source, target) in down_links:
+                    continue
+                active[source][target] = metric
+        routers = {}
+        for source in ordered_nodes:
+            if source in down_nodes:
+                routers[source] = {
+                    destination: {"nextHop": None, "metric": None}
+                    for destination in ordered_nodes
+                }
+            else:
+                routers[source] = forwarding_table(source, ordered_nodes, active)
+        return routers
+
+    timeline = [{"event": None, "routers": current_routers()}]
+    for event in events:
+        action = event["action"]
+        if action == "node-down":
+            down_nodes.add(event["node"])
+        elif action == "node-up":
+            down_nodes.discard(event["node"])
+        else:
+            pair = link_pair(event["from"], event["to"])
+            if action == "link-down":
+                down_links.add(pair)
+            else:
+                down_links.discard(pair)
+        timeline.append(
+            {"time": event["time"], "event": event, "routers": current_routers()}
+        )
+
+    output = {"protocol": "link-state", "timeline": timeline}
+    sys.stdout.write(json.dumps(output, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     command = args[0] if args else "help"
@@ -231,6 +378,11 @@ def main(argv: list[str] | None = None) -> int:
             print(CONVERGE_USAGE, file=sys.stderr)
             return 2
         return run_converge(args[1])
+    if command == "replay":
+        if len(args) != 3:
+            print(REPLAY_USAGE, file=sys.stderr)
+            return 2
+        return run_replay(args[1], args[2])
     if command in {"help", "-h", "--help"}:
         print(USAGE, end="")
         return 0
