@@ -24,3 +24,16 @@ each subsequent round updates every router synchronously from its neighbors'
 previous-round advertisements. Output records the initial snapshot and every
 changed snapshot through `convergenceRound`, with unreachable destinations
 reported as `null` next hop and metric.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+The suite exercises only the public CLI: differential checks that `converge`'s
+final snapshot matches `compute` exactly, hand-computed tables for fixed
+topologies, convergence-trajectory properties (round 0 contents, synchronous
+derivation, first stable round), byte-identical output for equivalent inputs
+and across `PYTHONHASHSEED` values, and the documented error behavior. It
+uses only the standard library.
