@@ -12,6 +12,7 @@ python3 -m packet_routing_sim compute TOPOLOGY.json
 python3 -m packet_routing_sim converge TOPOLOGY.json
 python3 -m packet_routing_sim replay TOPOLOGY.json SCENARIO.json
 python3 -m packet_routing_sim replay-dv TOPOLOGY.json SCENARIO.json
+python3 -m packet_routing_sim replay-ls TOPOLOGY.json SCENARIO.json
 python3 -m packet_routing_sim help
 ```
 
@@ -67,3 +68,33 @@ split horizon or poison reverse. A candidate metric at or above
 break to the smaller next-hop name. The recorded rounds make the rising
 metrics, alternating advertisements and final unreachability fully
 auditable.
+
+`replay-ls` reads the same topology and scenario format but replays the
+link-state protocol itself, exposing neighbor discovery, LSA flooding and
+SPF round by round. Output is
+`{"protocol": "link-state", "timeline": [...]}`; as with `replay`, the first
+timeline entry is the fault-free baseline (`event: null`) and each later
+entry echoes the event's `time` and `event` verbatim. Every timeline entry
+contains a `rounds` list and a `convergenceRound` pointer to the stable
+round. Each round holds `round` (starting at 0), `databases` and `routers`.
+
+In the baseline round 0 every online router discovers its available direct
+neighbors, originates a local LSA with sequence number 1 whose neighbors are
+sorted by name, and installs only that LSA into its own link-state database.
+In each following round every online router floods the newest LSAs it knows
+over each currently available link, and a receiver accepts an LSA from a
+given originator only when its sequence number is strictly higher than the
+one already held; rounds are recorded until no database changes. After an
+event the previous entry's converged databases are inherited; the online
+endpoints whose adjacency changed increment their local sequence and install
+their new LSA in round 0, while all other routers keep their old view. A
+recovering node continues numbering from its own historical sequence; a down
+node originates, sends or receives nothing and keeps no database.
+
+Each router computes its forwarding table independently from its own
+current-round database. A link participates in SPF only while both
+endpoints' newest held LSAs still declare each other (the single topology
+metric being the agreed metric); consequently a remote router that has not
+yet received a newer LSA can briefly keep a stale route, while a down
+router's whole row is `null`. Equal-cost paths still break to the smaller
+next-hop name.

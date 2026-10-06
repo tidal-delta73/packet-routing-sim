@@ -32,6 +32,7 @@ from packet_routing_sim.core import (
     compute_topology,
     converge_topology,
     replay_dv_scenario,
+    replay_ls_scenario,
     replay_scenario,
     validate_dv_scenario,
     validate_scenario,
@@ -495,6 +496,443 @@ class TestCorePurity(unittest.TestCase):
             self.assertNotIn("sys.stderr", text, path)
             self.assertNotIn("sys.argv", text, path)
             self.assertNotIn("os.environ", text, path)
+
+
+# ---------------------------------------------------------------------------
+# Link-state flooding replay (replay-ls core)
+# ---------------------------------------------------------------------------
+
+
+CHAIN4_LS = {
+    "nodes": ["A", "B", "C", "D"],
+    "links": [link("A", "B", 1), link("B", "C", 1), link("C", "D", 1)],
+}
+
+
+def _db_view(entry_round):
+    """{router: {originator: (sequence, neighbors)}} for one round."""
+    return {
+        router: None
+        if database is None
+        else {
+            originator: (lsa["sequence"], tuple(lsa["neighbors"]))
+            for originator, lsa in database.items()
+        }
+        for router, database in entry_round["databases"].items()
+    }
+
+
+class TestReplayLinkState(unittest.TestCase):
+    def test_envelope_and_baseline_shape(self):
+        result = replay_ls_scenario(
+            CHAIN3, {"events": [{"time": 1, "action": "node-down", "node": "B"}]}
+        )
+        self.assertEqual(set(result), {"protocol", "timeline"})
+        self.assertEqual(result["protocol"], "link-state")
+        timeline = result["timeline"]
+        self.assertEqual(len(timeline), 2)
+
+        baseline = timeline[0]
+        self.assertEqual(set(baseline), {"event", "convergenceRound", "rounds"})
+        self.assertIsNone(baseline["event"])
+        for snapshot in baseline["rounds"]:
+            self.assertEqual(set(snapshot), {"round", "databases", "routers"})
+
+        event_entry = timeline[1]
+        self.assertEqual(
+            set(event_entry), {"time", "event", "convergenceRound", "rounds"}
+        )
+        self.assertEqual(event_entry["time"], 1)
+        self.assertEqual(
+            event_entry["event"],
+            {"time": 1, "action": "node-down", "node": "B"},
+        )
+
+    def test_baseline_round_zero_is_self_origination_only(self):
+        baseline = replay_ls_scenario(CHAIN3, {"events": []})["timeline"][0]
+        round_zero = baseline["rounds"][0]
+        self.assertEqual(
+            _db_view(round_zero),
+            {
+                "A": {"A": (1, ("B",))},
+                "B": {"B": (1, ("A", "C"))},
+                "C": {"C": (1, ("B",))},
+            },
+        )
+        # Every LSA has exactly the two published fields and sorted neighbors.
+        for database in round_zero["databases"].values():
+            for lsa in database.values():
+                self.assertEqual(set(lsa), {"sequence", "neighbors"})
+        # Round 0 each router can reach only itself (it has no other LSA).
+        self.assertEqual(
+            round_zero["routers"]["A"]["C"], {"nextHop": None, "metric": None}
+        )
+        self.assertEqual(
+            round_zero["routers"]["B"]["A"], {"nextHop": None, "metric": None}
+        )
+
+    def test_lsas_propagate_one_hop_per_round(self):
+        baseline = replay_ls_scenario(CHAIN4_LS, {"events": []})["timeline"][0]
+        self.assertEqual(baseline["convergenceRound"], 3)
+        views = _db_view
+        ownership = [
+            {router: set(db) for router, db in views(snapshot).items()}
+            for snapshot in baseline["rounds"]
+        ]
+        self.assertEqual(
+            ownership[0],
+            {"A": {"A"}, "B": {"B"}, "C": {"C"}, "D": {"D"}},
+        )
+        self.assertEqual(
+            ownership[1],
+            {
+                "A": {"A", "B"},
+                "B": {"A", "B", "C"},
+                "C": {"B", "C", "D"},
+                "D": {"C", "D"},
+            },
+        )
+        self.assertEqual(
+            ownership[2],
+            {
+                "A": {"A", "B", "C"},
+                "B": {"A", "B", "C", "D"},
+                "C": {"A", "B", "C", "D"},
+                "D": {"B", "C", "D"},
+            },
+        )
+        self.assertEqual(
+            ownership[3],
+            {router: {"A", "B", "C", "D"} for router in "ABCD"},
+        )
+        # The converged per-database SPF result is the static link-state view.
+        self.assertEqual(
+            baseline["rounds"][-1]["routers"],
+            compute_topology(CHAIN4_LS)["routers"],
+        )
+
+    def test_rounds_are_contiguous_and_each_changes_to_a_fixed_point(self):
+        for topology in (EMPTY, SINGLE, COMPONENTS, CHAIN3, DIAMOND, CHAIN4_LS):
+            result = replay_ls_scenario(topology, {"events": []})
+            entry = result["timeline"][0]
+            numbers = [snapshot["round"] for snapshot in entry["rounds"]]
+            self.assertEqual(numbers, list(range(len(numbers))), topology)
+            self.assertEqual(entry["convergenceRound"], numbers[-1])
+            for previous, current in zip(entry["rounds"], entry["rounds"][1:]):
+                self.assertNotEqual(previous["databases"], current["databases"])
+
+    def test_disconnected_topologies_converge_at_round_zero(self):
+        # A topology whose nodes have no links at all is fixed at round 0.
+        isolated = {"nodes": ["x", "y"], "links": []}
+        entry = replay_ls_scenario(isolated, {"events": []})["timeline"][0]
+        self.assertEqual(entry["convergenceRound"], 0)
+
+        # COMPONENTS has two-node links: those exchange at round 1, but the
+        # fully isolated node never learns anyone else's LSA.
+        entry = replay_ls_scenario(COMPONENTS, {"events": []})["timeline"][0]
+        self.assertEqual(entry["convergenceRound"], 1)
+        round_zero = entry["rounds"][0]
+        self.assertEqual(
+            _db_view(round_zero)["iso"], {"iso": (1, ())}
+        )
+        self.assertEqual(
+            _db_view(round_zero)["a1"], {"a1": (1, ("a2",))}
+        )
+        # Nothing is learned across components even at the fixed point, and
+        # the isolated node's database never gains another originator.
+        final_view = _db_view(entry["rounds"][-1])
+        self.assertEqual(set(final_view["iso"]), {"iso"})
+        self.assertEqual(set(final_view["a1"]), {"a1", "a2"})
+        empty = replay_ls_scenario(EMPTY, {"events": []})["timeline"][0]
+        self.assertEqual(
+            empty,
+            {
+                "event": None,
+                "convergenceRound": 0,
+                "rounds": [{"round": 0, "databases": {}, "routers": {}}],
+            },
+        )
+
+    def test_link_down_floods_and_drops_the_stale_route(self):
+        scenario = {
+            "events": [{"time": 1, "action": "link-down", "from": "A", "to": "B"}]
+        }
+        entry = replay_ls_scenario(CHAIN3, scenario)["timeline"][1]
+        # A and B bump their own sequence at round 0; C is untouched.
+        round_zero = entry["rounds"][0]
+        self.assertEqual(
+            _db_view(round_zero)["A"]["A"], (2, ())
+        )
+        self.assertEqual(
+            _db_view(round_zero)["B"]["B"], (2, ("C",))
+        )
+        self.assertEqual(
+            _db_view(round_zero)["C"]["C"], (1, ("B",))
+        )
+        # C did not change adjacency: it keeps the old view and at round 0
+        # still routes to A through B using the stale mutual LSAs.
+        self.assertEqual(
+            round_zero["routers"]["C"]["A"], {"nextHop": "B", "metric": 12}
+        )
+        # One flooding round later C has B's seq-2 LSA; the A-B edge is gone
+        # from every consistent view and the stale route disappears.
+        self.assertEqual(entry["convergenceRound"], 1)
+        final = entry["rounds"][1]
+        self.assertEqual(_db_view(final)["C"]["B"], (2, ("C",)))
+        self.assertEqual(
+            final["routers"]["C"]["A"], {"nextHop": None, "metric": None}
+        )
+        self.assertEqual(
+            final["routers"]["C"]["B"], {"nextHop": "B", "metric": 7}
+        )
+        self.assertEqual(
+            final["routers"]["A"]["B"], {"nextHop": None, "metric": None}
+        )
+
+    def test_node_down_keeps_null_database_and_router_rows(self):
+        scenario = {
+            "events": [{"time": 1, "action": "node-down", "node": "B"}]
+        }
+        entry = replay_ls_scenario(CHAIN3, scenario)["timeline"][1]
+        for snapshot in entry["rounds"]:
+            self.assertIsNone(snapshot["databases"]["B"])
+            self.assertIsNone(snapshot["routers"]["B"])
+            # Online routers keep a (stale) database entry for B at first.
+        round_zero = entry["rounds"][0]
+        self.assertEqual(_db_view(round_zero)["A"]["A"], (2, ()))
+        self.assertEqual(_db_view(round_zero)["C"]["C"], (2, ()))
+        # A and C are now isolated; nothing can be flooded to either side.
+        self.assertEqual(entry["convergenceRound"], 0)
+        self.assertEqual(
+            round_zero["routers"]["A"]["C"], {"nextHop": None, "metric": None}
+        )
+
+    def test_recovered_node_continues_sequence_and_relearns_neighbors(self):
+        scenario = {
+            "events": [
+                {"time": 1, "action": "node-down", "node": "B"},
+                {"time": 2, "action": "node-up", "node": "B"},
+            ]
+        }
+        timeline = replay_ls_scenario(CHAIN3, scenario)["timeline"]
+        recovery_round_zero = timeline[2]["rounds"][0]
+        # B restarts with an empty database but its own LSA continues at 2.
+        self.assertEqual(
+            _db_view(recovery_round_zero)["B"], {"B": (2, ("A", "C"))}
+        )
+        # Neighbors still carry B's old seq-1 LSA at round 0, so A can keep a
+        # stale end-to-end route built from the old view; B itself knows
+        # nobody yet.
+        self.assertEqual(
+            recovery_round_zero["routers"]["A"]["C"],
+            {"nextHop": "B", "metric": 12},
+        )
+        self.assertEqual(
+            recovery_round_zero["routers"]["B"]["A"],
+            {"nextHop": None, "metric": None},
+        )
+        # After flooding all databases agree and tables match the baseline.
+        final = timeline[2]["rounds"][-1]
+        self.assertEqual(
+            _db_view(final)["A"],
+            {"A": (3, ("B",)), "B": (2, ("A", "C")), "C": (3, ("B",))},
+        )
+        self.assertEqual(
+            final["routers"], compute_topology(CHAIN3)["routers"]
+        )
+
+    def test_repeated_down_up_keeps_incrementing_from_history(self):
+        scenario = {
+            "events": [
+                {"time": 1, "action": "node-down", "node": "B"},
+                {"time": 2, "action": "node-up", "node": "B"},
+                {"time": 3, "action": "node-down", "node": "B"},
+                {"time": 4, "action": "node-up", "node": "B"},
+            ]
+        }
+        timeline = replay_ls_scenario(CHAIN3, scenario)["timeline"]
+        self.assertEqual(_db_view(timeline[2]["rounds"][0])["B"]["B"], (2, ("A", "C")))
+        self.assertEqual(_db_view(timeline[4]["rounds"][0])["B"]["B"], (3, ("A", "C")))
+
+    def test_explicit_link_down_survives_node_recovery(self):
+        scenario = {
+            "events": [
+                {"time": 1, "action": "link-down", "from": "A", "to": "B"},
+                {"time": 2, "action": "node-down", "node": "B"},
+                {"time": 3, "action": "node-up", "node": "B"},
+            ]
+        }
+        timeline = replay_ls_scenario(CHAIN3, scenario)["timeline"]
+        final = timeline[3]["rounds"][-1]
+        view = _db_view(final)
+        # B bumped its sequence on the link-down (seq 2) and again on
+        # recovery (seq 3); its recovered LSA names only C.
+        self.assertEqual(view["B"]["B"], (3, ("C",)))
+        # Both A and B keep stale pre-failure LSAs for each other because no
+        # withdrawal crosses the disabled link: A holds B's baseline LSA and
+        # B holds A's.
+        self.assertEqual(view["A"]["B"], (1, ("A", "C")))
+        self.assertEqual(view["B"]["A"], (1, ("B",)))
+        # B's own current LSA no longer names A, so the stale declarations
+        # never form a mutual edge and neither side routes across it.
+        self.assertEqual(
+            final["routers"]["A"]["B"], {"nextHop": None, "metric": None}
+        )
+        self.assertEqual(
+            final["routers"]["A"]["C"], {"nextHop": None, "metric": None}
+        )
+        self.assertEqual(
+            final["routers"]["B"]["C"], {"nextHop": "C", "metric": 7}
+        )
+
+    def test_reversed_link_endpoints_round_trip(self):
+        scenario = {
+            "events": [
+                {"time": 1, "action": "link-down", "from": "A", "to": "B"},
+                {"time": 2, "action": "link-up", "from": "B", "to": "A"},
+            ]
+        }
+        timeline = replay_ls_scenario(CHAIN3, scenario)["timeline"]
+        final = timeline[2]["rounds"][-1]
+        self.assertEqual(final["routers"], compute_topology(CHAIN3)["routers"])
+        # The restored link is re-declared by seq-2 LSAs on both endpoints.
+        self.assertEqual(_db_view(final)["A"]["A"], (3, ("B",)))
+        self.assertEqual(_db_view(final)["B"]["B"], (3, ("A", "C")))
+
+    def test_equal_cost_picks_smaller_next_hop(self):
+        timeline = replay_ls_scenario(DIAMOND, {"events": []})["timeline"]
+        final = timeline[0]["rounds"][-1]
+        self.assertEqual(final["routers"]["A"]["D"]["nextHop"], "B")
+        self.assertEqual(final["routers"]["D"]["A"]["nextHop"], "B")
+        self.assertEqual(final["routers"]["B"]["C"]["nextHop"], "A")
+
+    def test_events_are_echoed_verbatim_in_order(self):
+        events = [
+            {"time": 3, "action": "link-down", "from": "A", "to": "B"},
+            {"time": 9, "action": "node-down", "node": "C"},
+        ]
+        timeline = replay_ls_scenario(DIAMOND, {"events": events})["timeline"]
+        self.assertEqual(len(timeline), 3)
+        for index, event in enumerate(events, start=1):
+            self.assertEqual(timeline[index]["time"], event["time"])
+            self.assertEqual(timeline[index]["event"], event)
+
+
+class TestReplayLinkStateValidation(unittest.TestCase):
+    def test_invalid_topology_raises_invalid_topology(self):
+        with self.assertRaises(InvalidTopology):
+            replay_ls_scenario({"nodes": ["A", "A"], "links": []}, {"events": []})
+
+    def test_invalid_scenarios_raise_invalid_scenario(self):
+        invalid = [
+            [], "x", 42, {},
+            {"events": {}}, {"events": [None]},
+            {"events": [{"time": 1, "action": "explode", "node": "A"}]},
+            {"events": [{"time": 0, "action": "node-down", "node": "A"}]},
+            {"events": [{"time": 1, "action": "link-down", "from": "A", "to": "Z"}]},
+        ]
+        for index, scenario in enumerate(invalid):
+            with self.subTest(case=index):
+                with self.assertRaises(InvalidScenario):
+                    replay_ls_scenario(CHAIN3, scenario)
+
+    def test_illegal_transitions_raise_distinguishably(self):
+        cases = [
+            {"events": [{"time": 1, "action": "node-up", "node": "A"}]},
+            {"events": [{"time": 1, "action": "link-up", "from": "A", "to": "B"}]},
+            {
+                "events": [
+                    {"time": 1, "action": "node-down", "node": "A"},
+                    {"time": 2, "action": "node-down", "node": "A"},
+                ]
+            },
+        ]
+        for index, scenario in enumerate(cases):
+            with self.subTest(case=index):
+                with self.assertRaises(InvalidStateTransition):
+                    replay_ls_scenario(CHAIN3, scenario)
+
+    def test_topology_errors_take_precedence(self):
+        with self.assertRaises(InvalidTopology):
+            replay_ls_scenario(
+                {"nodes": ["A", "A"], "links": []},
+                {"events": [{"time": 1, "action": "explode"}]},
+            )
+
+
+class TestReplayLinkStatePurity(unittest.TestCase):
+    SCENARIO = {
+        "events": [
+            {"time": 1, "action": "link-down", "from": "A", "to": "B"},
+            {"time": 2, "action": "node-down", "node": "B"},
+            {"time": 3, "action": "node-up", "node": "B"},
+            {"time": 4, "action": "link-up", "from": "B", "to": "A"},
+        ]
+    }
+
+    def test_inputs_remain_equal(self):
+        topology_before = copy.deepcopy(CHAIN3)
+        scenario_before = copy.deepcopy(self.SCENARIO)
+        replay_ls_scenario(CHAIN3, self.SCENARIO)
+        self.assertEqual(CHAIN3, topology_before)
+        self.assertEqual(self.SCENARIO, scenario_before)
+
+    def test_no_carry_over_between_calls(self):
+        faulted = replay_ls_scenario(
+            CHAIN3,
+            {"events": [{"time": 1, "action": "node-down", "node": "B"}]},
+        )
+        for snapshot in faulted["timeline"][1]["rounds"]:
+            self.assertIsNone(snapshot["routers"]["B"])
+        fresh = replay_ls_scenario(CHAIN3, {"events": []})
+        baseline = fresh["timeline"][0]
+        self.assertEqual(baseline["convergenceRound"], 2)
+        # A fresh baseline starts at sequence 1 for every originator.
+        for database in baseline["rounds"][-1]["databases"].values():
+            for lsa in database.values():
+                self.assertEqual(lsa["sequence"], 1)
+        self.assertEqual(
+            replay_ls_scenario(CHAIN3, copy.deepcopy(self.SCENARIO)),
+            replay_ls_scenario(CHAIN3, copy.deepcopy(self.SCENARIO)),
+        )
+
+    def test_mutating_result_cannot_pollute_later_calls(self):
+        scenario = {
+            "events": [{"time": 1, "action": "node-down", "node": "B"}]
+        }
+        first = replay_ls_scenario(CHAIN3, scenario)
+        first["timeline"][1]["rounds"][0]["databases"]["A"]["A"] = {
+            "sequence": 999, "neighbors": ["HACK"],
+        }
+        first["timeline"][1]["event"]["node"] = "C"
+        second = replay_ls_scenario(CHAIN3, copy.deepcopy(scenario))
+        self.assertEqual(
+            _db_view(second["timeline"][1]["rounds"][0])["A"]["A"], (2, ())
+        )
+        self.assertEqual(second["timeline"][1]["event"]["node"], "B")
+
+    def test_echoed_event_is_not_aliased_to_input(self):
+        result = replay_ls_scenario(
+            CHAIN3,
+            {"events": [{"time": 1, "action": "node-down", "node": "B"}]},
+        )
+        scenario = {"events": [{"time": 1, "action": "node-down", "node": "B"}]}
+        self.assertIsNot(
+            result["timeline"][1]["event"],
+            {"time": 1, "action": "node-down", "node": "B"},
+        )
+
+    def test_result_is_json_serialisable_and_sorted(self):
+        result = replay_ls_scenario(CHAIN3, copy.deepcopy(self.SCENARIO))
+        json.loads(json.dumps(result))
+        for entry in result["timeline"]:
+            for snapshot in entry["rounds"]:
+                self.assertEqual(list(snapshot["databases"]), ["A", "B", "C"])
+                online = [r for r in snapshot["routers"]]
+                self.assertEqual(online, ["A", "B", "C"])
+                for router, database in snapshot["databases"].items():
+                    if database is not None:
+                        self.assertEqual(list(database), sorted(database))
 
 
 # ---------------------------------------------------------------------------
@@ -1057,6 +1495,7 @@ out = {}
 out["compute"] = core.compute_topology(topology)
 out["converge"] = core.converge_topology(topology)
 out["replay"] = core.replay_scenario(topology, scenario)
+out["replay_ls"] = core.replay_ls_scenario(topology, scenario)
 sys.stdout.write(json.dumps(out, sort_keys=True))
 """ % str(REPO_ROOT)
 

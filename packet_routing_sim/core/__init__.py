@@ -5,6 +5,8 @@ Public entry points:
 * :func:`compute_topology`    -> ``{"routers": ...}``
 * :func:`converge_topology`   -> ``{"protocol", "convergenceRound", "rounds"}``
 * :func:`replay_scenario`     -> ``{"protocol", "timeline"}`` (link-state)
+* :func:`replay_ls_scenario`  -> ``{"protocol", "timeline"}`` with auditable
+  neighbor discovery, LSA flooding and per-database SPF rounds
 * :func:`replay_dv_scenario`  -> ``{"protocol", "infinityMetric",
   "timeline"}`` (distance-vector)
 
@@ -34,6 +36,13 @@ from .errors import (
     InvalidTopology,
     SimulationError,
 )
+from .linkstate import (
+    active_neighbor_sets,
+    baseline_databases,
+    changed_endpoints,
+    event_databases,
+    link_state_convergence,
+)
 from .routing import (
     distance_vector_convergence,
     distance_vector_failure_convergence,
@@ -51,6 +60,8 @@ __all__ = [
     "converge_topology",
     "replay_scenario",
     "replay_validated",
+    "replay_ls_scenario",
+    "replay_ls_validated",
     "replay_dv_scenario",
     "replay_dv_validated",
     "snapshot_state",
@@ -133,6 +144,94 @@ def replay_scenario(topology, scenario):
     and link availability.
     """
     return replay_validated(_validated(topology), scenario)
+
+
+def replay_ls_validated(topo, scenario):
+    """Auditable link-state timeline from an already-validated topology.
+
+    Mirrors :func:`replay_validated` (topology already validated, only the
+    scenario validated here) but replays the protocol itself: every timeline
+    entry carries ``rounds`` (each with ``round``, ``databases`` and
+    ``routers``) from round 0 through a flooding fixed point, plus the
+    final ``convergenceRound``.  The baseline entry has ``event: null``;
+    event entries echo ``time`` and the raw event verbatim.
+
+    Converged databases and per-node sequence history carry from one entry
+    to the next, while every *call* starts from the fault-free state.
+    """
+    events = validate_scenario(topo, copy.deepcopy(scenario))
+
+    ordered_nodes = topo.nodes
+    state = NetworkState.initial(topo)
+    baseline_neighbors = active_neighbor_sets(
+        ordered_nodes, state.active_adjacency()
+    )
+    databases, sequences = baseline_databases(ordered_nodes, baseline_neighbors)
+    baseline_rounds, databases = link_state_convergence(
+        databases,
+        ordered_nodes,
+        topo,
+        state.active_adjacency(),
+        state.down_nodes,
+    )
+    timeline = [
+        {
+            "event": None,
+            "convergenceRound": baseline_rounds[-1]["round"],
+            "rounds": baseline_rounds,
+        }
+    ]
+
+    for event in events:
+        previous_state = state
+        state = apply_event(state, event)
+        recovered = previous_state.down_nodes - state.down_nodes
+        active_adjacency = state.active_adjacency()
+        new_neighbors = active_neighbor_sets(ordered_nodes, active_adjacency)
+        old_neighbors = active_neighbor_sets(
+            ordered_nodes, previous_state.active_adjacency()
+        )
+        changed = changed_endpoints(
+            ordered_nodes,
+            old_neighbors,
+            new_neighbors,
+            state.down_nodes,
+            recovered,
+        )
+        databases, sequences = event_databases(
+            databases,
+            ordered_nodes,
+            new_neighbors,
+            state.down_nodes,
+            changed,
+            sequences,
+        )
+        rounds, databases = link_state_convergence(
+            databases,
+            ordered_nodes,
+            topo,
+            active_adjacency,
+            state.down_nodes,
+        )
+        timeline.append(
+            {
+                "time": event.time,
+                "event": event.raw,
+                "convergenceRound": rounds[-1]["round"],
+                "rounds": rounds,
+            }
+        )
+    return {"protocol": "link-state", "timeline": timeline}
+
+
+def replay_ls_scenario(topology, scenario):
+    """Auditable link-state timeline for a decoded topology and scenario.
+
+    Always begins from the fault-free state; neither databases, sequence
+    counters nor failure state carry over from a previous call, and inputs
+    are deep-copied so caller data and returned data never alias.
+    """
+    return replay_ls_validated(_validated(topology), scenario)
 
 
 def replay_dv_validated(topo, scenario):

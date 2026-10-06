@@ -1413,6 +1413,463 @@ class TestReplayDVInvalidScenarios(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# replay-ls: independent neighbor-discovery/LSA-flooding/SPF oracle
+# ---------------------------------------------------------------------------
+
+
+REPLAY_LS_USAGE = (
+    "usage: python3 -m packet_routing_sim replay-ls TOPOLOGY.json SCENARIO.json\n"
+)
+
+
+def invoke_replay_ls(directory, topology, scenario, seed=0):
+    topo_path = write_topology(directory, topology)
+    scenario_path = write_scenario(directory, scenario)
+    return run_cli(
+        ["replay-ls", str(topo_path), str(scenario_path)], seed=seed
+    )
+
+
+def _active_map(nodes, adjacency, down_nodes, disabled):
+    """Fresh adjacency map of usable links for an availability state."""
+    active = {node: {} for node in nodes}
+    for source in nodes:
+        if source in down_nodes:
+            continue
+        for target, metric in adjacency[source].items():
+            if target in down_nodes:
+                continue
+            if frozenset((source, target)) in disabled:
+                continue
+            active[source][target] = metric
+    return active
+
+
+def _flood(db, nodes, active, down_nodes):
+    """One synchronous LSA flooding exchange, independently of the SUT."""
+    current = {
+        node: {originator: (seq, set(nbrs))
+               for originator, (seq, nbrs) in db[node].items()}
+        for node in nodes
+        if node not in down_nodes
+    }
+    for receiver in nodes:
+        if receiver in down_nodes:
+            continue
+        for neighbor in sorted(active[receiver]):
+            for originator in sorted(db[neighbor]):
+                incoming_seq, incoming_nbrs = db[neighbor][originator]
+                known = current[receiver].get(originator)
+                if known is None or incoming_seq > known[0]:
+                    current[receiver][originator] = (
+                        incoming_seq, set(incoming_nbrs)
+                    )
+    return {
+        node: {originator: (seq, frozenset(nbrs))
+               for originator, (seq, nbrs) in current[node].items()}
+        for node in current
+    }
+
+
+def ls_oracle_timeline(topology, scenario):
+    """Independently reproduce the whole replay-ls timeline.
+
+    Returns a list of entries; each is ``(time, rounds)`` where ``time`` is
+    ``None`` for the baseline and ``rounds`` is a list of
+    ``(number, databases_norm, routers_norm)``.  Down routers normalize to
+    ``None`` in both maps.
+    """
+    nodes, adjacency = build_adjacency(topology)
+    down_nodes, disabled = set(), set()
+
+    def state_maps():
+        active = _active_map(nodes, adjacency, down_nodes, disabled)
+        return {node: frozenset(active[node]) for node in nodes}, active
+
+    def router_rows(owner, db):
+        if owner in down_nodes:
+            return None
+        edges = {node: {} for node in nodes}
+        present = set(db)
+        for source in nodes:
+            for target, metric in adjacency[source].items():
+                if source not in present or target not in present:
+                    continue
+                if target in db[source][1] and source in db[target][1]:
+                    edges[source][target] = metric
+        dist = floyd_warshall(nodes, edges)
+        rows = {}
+        for dest in nodes:
+            if dest == owner:
+                rows[dest] = (None, 0)
+            elif dist[owner][dest] == float("inf"):
+                rows[dest] = (None, None)
+            else:
+                winners = [
+                    neighbor
+                    for neighbor in edges[owner]
+                    if dist[neighbor][dest] != float("inf")
+                    and edges[owner][neighbor] + dist[neighbor][dest]
+                    == dist[owner][dest]
+                ]
+                rows[dest] = (min(winners), dist[owner][dest])
+        return rows
+
+    def snapshot(db):
+        databases_norm = {}
+        routers_norm = {}
+        for node in nodes:
+            if node in down_nodes:
+                databases_norm[node] = None
+                routers_norm[node] = None
+            else:
+                databases_norm[node] = {
+                    originator: (seq, tuple(sorted(nbrs)))
+                    for originator, (seq, nbrs) in sorted(db[node].items())
+                }
+                routers_norm[node] = router_rows(node, db[node])
+        return databases_norm, routers_norm
+
+    def converge(db, active):
+        rounds = [(0, *snapshot(db))]
+        number = 1
+        while True:
+            updated = _flood(db, nodes, active, down_nodes)
+            if updated == db:
+                return rounds, db
+            db = updated
+            rounds.append((number, *snapshot(db)))
+            number += 1
+
+    nbr_sets, active = state_maps()
+    history = {}
+    db = {}
+    for node in nodes:
+        seq = 1
+        history[node] = seq
+        db[node] = {node: (seq, nbr_sets[node])}
+    timeline = [(None, *converge(db, active))]
+    db = timeline[0][2]
+
+    for event in scenario["events"]:
+        prev_down = set(down_nodes)
+        prev_nbrs = dict(nbr_sets)
+        action = event["action"]
+        if action == "node-down":
+            down_nodes.add(event["node"])
+        elif action == "node-up":
+            down_nodes.discard(event["node"])
+        elif action == "link-down":
+            disabled.add(frozenset((event["from"], event["to"])))
+        else:
+            disabled.discard(frozenset((event["from"], event["to"])))
+        nbr_sets, active = state_maps()
+        recovered = prev_down - down_nodes
+        changed = set(recovered)
+        for node in nodes:
+            if node in down_nodes:
+                continue
+            if prev_nbrs.get(node, frozenset()) != nbr_sets[node]:
+                changed.add(node)
+
+        db = {
+            node: {
+                originator: (seq, frozenset(nbrs))
+                for originator, (seq, nbrs) in db[node].items()
+            }
+            for node in nodes
+            if node in db and node not in down_nodes
+        }
+        for node in sorted(changed):
+            if node in down_nodes:
+                continue
+            seq = history.get(node, 0) + 1
+            history[node] = seq
+            db.setdefault(node, {})[node] = (seq, nbr_sets[node])
+
+        rounds, db = converge(db, active)
+        timeline.append((event["time"], rounds, db))
+    return timeline
+
+
+def normalize_ls_result(result):
+    """Convert replay-ls JSON to the oracle's comparable structures."""
+    timeline = []
+    for entry in result["timeline"]:
+        rounds = []
+        for snapshot in entry["rounds"]:
+            databases = {}
+            for router, database in snapshot["databases"].items():
+                if database is None:
+                    databases[router] = None
+                else:
+                    databases[router] = {
+                        originator: (lsa["sequence"], tuple(lsa["neighbors"]))
+                        for originator, lsa in database.items()
+                    }
+            routers = {}
+            for router, row in snapshot["routers"].items():
+                if row is None:
+                    routers[router] = None
+                else:
+                    routers[router] = {
+                        dest: (table["nextHop"], table["metric"])
+                        for dest, table in row.items()
+                    }
+            rounds.append((snapshot["round"], databases, routers))
+        timeline.append((entry.get("time"), rounds))
+    return timeline
+
+
+class TestReplayLS(unittest.TestCase):
+    def test_envelope_and_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_ls(
+                tmp, CHAIN3,
+                {"events": [{"time": 1, "action": "node-down", "node": "B"}]},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stderr, b"")
+            result = json.loads(proc.stdout)
+            self.assertEqual(set(result), {"protocol", "timeline"})
+            self.assertEqual(result["protocol"], "link-state")
+            timeline = result["timeline"]
+            self.assertEqual(len(timeline), 2)
+
+            baseline = timeline[0]
+            self.assertEqual(
+                set(baseline), {"event", "convergenceRound", "rounds"}
+            )
+            self.assertIsNone(baseline["event"])
+            for snapshot in baseline["rounds"]:
+                self.assertEqual(set(snapshot), {"round", "databases", "routers"})
+                database = next(iter(snapshot["databases"].values()))
+                lsa = next(iter(database.values()))
+                self.assertEqual(set(lsa), {"sequence", "neighbors"})
+            event_entry = timeline[1]
+            self.assertEqual(
+                set(event_entry), {"time", "event", "convergenceRound", "rounds"}
+            )
+
+    def test_baseline_converges_to_compute(self):
+        for topology in (CHAIN3, DIAMOND, RING, COMPONENTS, SQUARE):
+            with self.subTest(topology=topology), tempfile.TemporaryDirectory() as tmp:
+                proc = invoke_replay_ls(tmp, topology, {"events": []})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                result = json.loads(proc.stdout)
+                final = result["timeline"][0]["rounds"][-1]
+                compute = json.loads(
+                    run_cli(
+                        ["compute", str(write_topology(tmp, topology, "t.json"))]
+                    ).stdout
+                )
+                self.assertEqual(final["routers"], compute["routers"], topology)
+
+    def test_timeline_matches_independent_oracle(self):
+        scenario = {"events": list(REPLAY_SCENARIO)}
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_ls(tmp, DIAMOND, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            actual = normalize_ls_result(result)
+            expected = ls_oracle_timeline(DIAMOND, scenario)
+            self.assertEqual(len(actual), len(expected))
+            for index, ((actual_time, actual_rounds),
+                        (expected_time, expected_rounds, *_)) in enumerate(
+                zip(actual, expected)
+            ):
+                self.assertEqual(actual_time, expected_time, index)
+                self.assertEqual(
+                    [number for number, _, _ in actual_rounds],
+                    list(range(len(actual_rounds))),
+                    index,
+                )
+                self.assertEqual(
+                    result["timeline"][index]["convergenceRound"],
+                    actual_rounds[-1][0],
+                    index,
+                )
+                self.assertEqual(
+                    [(d, r) for _, d, r in actual_rounds],
+                    [(d, r) for _, d, r in expected_rounds],
+                    index,
+                )
+
+    def test_oracle_covers_node_failure_and_recovery(self):
+        scenario = {
+            "events": [
+                {"time": 1, "action": "node-down", "node": "B"},
+                {"time": 2, "action": "node-up", "node": "B"},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_ls(tmp, CHAIN3, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            actual = normalize_ls_result(json.loads(proc.stdout))
+            expected = ls_oracle_timeline(CHAIN3, scenario)
+            for (at, ar), (et, er, *_) in zip(actual, expected):
+                self.assertEqual(at, et)
+                self.assertEqual([(d, r) for _, d, r in ar],
+                                 [(d, r) for _, d, r in er])
+
+    def test_stale_route_is_visible_then_withdrawn(self):
+        scenario = {
+            "events": [{"time": 1, "action": "link-down", "from": "A", "to": "B"}]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_ls(tmp, CHAIN3, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            rounds = json.loads(proc.stdout)["timeline"][1]["rounds"]
+            # Round 0: C still holds the old mutual LSAs and routes via B.
+            self.assertEqual(
+                rounds[0]["routers"]["C"]["A"], {"nextHop": "B", "metric": 12}
+            )
+            # Round 1: B's new LSA removes A; the edge and route disappear.
+            self.assertEqual(
+                rounds[1]["routers"]["C"]["A"], {"nextHop": None, "metric": None}
+            )
+
+    def test_down_router_rows_are_null_in_every_round(self):
+        scenario = {
+            "events": [{"time": 1, "action": "node-down", "node": "B"}]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_ls(tmp, CHAIN3, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            for snapshot in json.loads(proc.stdout)["timeline"][1]["rounds"]:
+                self.assertIsNone(snapshot["databases"]["B"])
+                self.assertIsNone(snapshot["routers"]["B"])
+
+    def test_recovered_node_continues_sequence(self):
+        scenario = {
+            "events": [
+                {"time": 1, "action": "node-down", "node": "B"},
+                {"time": 2, "action": "node-up", "node": "B"},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_ls(tmp, CHAIN3, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            recovery = json.loads(proc.stdout)["timeline"][2]
+            round_zero = recovery["rounds"][0]
+            self.assertEqual(
+                round_zero["databases"]["B"],
+                {"B": {"sequence": 2, "neighbors": ["A", "C"]}},
+            )
+            # Full recovery restores the static tables.
+            final = recovery["rounds"][-1]
+            compute = json.loads(
+                run_cli(
+                    ["compute", str(write_topology(tmp, CHAIN3, "t.json"))]
+                ).stdout
+            )
+            self.assertEqual(final["routers"], compute["routers"])
+
+    def test_empty_topology(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_ls(tmp, EMPTY, {"events": []})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                json.loads(proc.stdout),
+                {
+                    "protocol": "link-state",
+                    "timeline": [
+                        {
+                            "event": None,
+                            "convergenceRound": 0,
+                            "rounds": [
+                                {"round": 0, "databases": {}, "routers": {}}
+                            ],
+                        }
+                    ],
+                },
+            )
+
+    def test_byte_identity_across_seeds_and_declaration_order(self):
+        scenario = {"events": list(REPLAY_SCENARIO)}
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs = set()
+            for seed in HASH_SEEDS:
+                for index, variant in enumerate(EQUIVALENT_VARIANTS):
+                    topo_path = write_topology(tmp, variant, f"v{index}.json")
+                    scen_path = write_scenario(tmp, scenario, f"s{index}.json")
+                    proc = run_cli(
+                        ["replay-ls", str(topo_path), str(scen_path)], seed=seed
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    outputs.add(proc.stdout)
+            self.assertEqual(len(outputs), 1)
+
+
+class TestReplayLSInvalidScenarios(unittest.TestCase):
+    def _assert_invalid(self, directory, scenario):
+        proc = invoke_replay_ls(directory, CHAIN3, scenario)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(proc.stderr, b"invalid scenario\n")
+
+    def test_invalid_scenarios(self):
+        cases = [
+            [], "x", 42, {},
+            {"events": {}}, {"events": [None]},
+            {"events": [{"time": 1, "action": "explode", "node": "A"}]},
+            {"events": [{"time": 0, "action": "node-down", "node": "A"}]},
+            {"events": [{"time": 1, "action": "link-down", "from": "A", "to": "Z"}]},
+            {"events": [{"time": 1, "action": "node-up", "node": "A"}]},
+            {"events": [{"time": 1, "action": "link-up", "from": "A", "to": "B"}]},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, scenario in enumerate(cases):
+                with self.subTest(case=index):
+                    self._assert_invalid(tmp, scenario)
+
+    def test_unreadable_and_unparseable_scenario(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            topo_path = write_topology(tmp, CHAIN3)
+            missing = str(Path(tmp) / "nope.json")
+            proc = run_cli(["replay-ls", str(topo_path), missing])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(
+                proc.stderr, f"cannot read scenario: {missing}\n".encode()
+            )
+            broken = Path(tmp) / "broken.json"
+            broken.write_text("{bad", encoding="utf-8")
+            proc = run_cli(["replay-ls", str(topo_path), str(broken)])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(proc.stderr, b"invalid scenario\n")
+
+    def test_topology_errors_take_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_topo = str(Path(tmp) / "missing.json")
+            proc = run_cli(["replay-ls", missing_topo, "also-missing.json"])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(
+                proc.stderr, f"cannot read topology: {missing_topo}\n".encode()
+            )
+            bad_topo = write_topology(tmp, {"nodes": ["A", "A"], "links": []})
+            scen = write_scenario(tmp, {"events": []})
+            proc = run_cli(["replay-ls", str(bad_topo), str(scen)])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(proc.stderr, b"invalid topology\n")
+
+    def test_argument_count_errors(self):
+        for args in (
+            ["replay-ls"],
+            ["replay-ls", "a.json"],
+            ["replay-ls", "a.json", "b.json", "c.json"],
+        ):
+            with self.subTest(args=args):
+                proc = run_cli(args)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, b"")
+                self.assertEqual(proc.stderr, REPLAY_LS_USAGE.encode())
+
+
+# ---------------------------------------------------------------------------
 # Existing CLI contract that must not change
 # ---------------------------------------------------------------------------
 
