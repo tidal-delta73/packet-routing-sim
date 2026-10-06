@@ -40,13 +40,34 @@ def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def validate_scenario(topology, scenario):
-    """Validate a decoded scenario against a validated topology.
+def validate_dv_scenario(topology, scenario):
+    """Validate a distance-vector replay scenario.
 
-    Return a tuple of immutable :class:`Event` records in time order.  Raise
-    :class:`InvalidScenario` for malformed structure or values, and its
-    subclass :class:`InvalidStateTransition` for an otherwise well-formed
-    event that cannot be applied from the preceding state.
+    Beyond the shared event rules the scenario must carry an
+    ``infinityMetric``: a non-boolean positive integer strictly greater
+    than every declared link metric.  Return ``(events, infinity_metric)``.
+    """
+    if not isinstance(scenario, dict):
+        raise InvalidScenario("scenario must be an object")
+    infinity_metric = scenario.get("infinityMetric")
+    if not _is_int(infinity_metric) or infinity_metric <= 0:
+        raise InvalidScenario("infinityMetric must be a positive integer")
+    max_link_metric = max(
+        (metric for _pair, metric in topology.links), default=0
+    )
+    if infinity_metric <= max_link_metric:
+        raise InvalidScenario(
+            "infinityMetric must exceed every link metric"
+        )
+    return _validate_events(topology, scenario), infinity_metric
+
+
+def _validate_events(topology, scenario):
+    """Validate the shared event sequence; return events in time order.
+
+    Structure, value, reference and time checks live here, alongside a fold
+    over :func:`state.apply_event` so illegal event sequences raise
+    :class:`InvalidStateTransition` through one authoritative rule set.
     """
     if not isinstance(scenario, dict):
         raise InvalidScenario("scenario must be an object")
@@ -100,3 +121,14 @@ def validate_scenario(topology, scenario):
         last_time = time
 
     return tuple(events)
+
+
+def validate_scenario(topology, scenario):
+    """Validate a decoded scenario against a validated topology.
+
+    Return a tuple of immutable :class:`Event` records in time order.  Raise
+    :class:`InvalidScenario` for malformed structure or values, and its
+    subclass :class:`InvalidStateTransition` for an otherwise well-formed
+    event that cannot be applied from the preceding state.
+    """
+    return _validate_events(topology, scenario)

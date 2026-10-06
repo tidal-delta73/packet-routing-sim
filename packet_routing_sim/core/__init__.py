@@ -2,9 +2,11 @@
 
 Public entry points:
 
-* :func:`compute_topology`  -> ``{"routers": ...}``
-* :func:`converge_topology` -> ``{"protocol", "convergenceRound", "rounds"}``
-* :func:`replay_scenario`   -> ``{"protocol", "timeline"}``
+* :func:`compute_topology`    -> ``{"routers": ...}``
+* :func:`converge_topology`   -> ``{"protocol", "convergenceRound", "rounds"}``
+* :func:`replay_scenario`     -> ``{"protocol", "timeline"}`` (link-state)
+* :func:`replay_dv_scenario`  -> ``{"protocol", "infinityMetric",
+  "timeline"}`` (distance-vector)
 
 Each entry point takes already-decoded JSON values (plain ``dict``/``list``/
 ``str``/``int``) and returns fresh plain-Python data.  The core performs no
@@ -34,10 +36,13 @@ from .errors import (
 )
 from .routing import (
     distance_vector_convergence,
+    distance_vector_failure_convergence,
+    distance_vector_failure_round_zero,
     forwarding_table,
+    initial_distance_vectors,
     link_state_snapshot,
 )
-from .scenario import validate_scenario
+from .scenario import validate_dv_scenario, validate_scenario
 from .state import NetworkState, apply_event
 from .topology import Topology, validate_topology
 
@@ -46,9 +51,12 @@ __all__ = [
     "converge_topology",
     "replay_scenario",
     "replay_validated",
+    "replay_dv_scenario",
+    "replay_dv_validated",
     "snapshot_state",
     "validate_topology",
     "validate_scenario",
+    "validate_dv_scenario",
     "Topology",
     "NetworkState",
     "apply_event",
@@ -125,3 +133,78 @@ def replay_scenario(topology, scenario):
     and link availability.
     """
     return replay_validated(_validated(topology), scenario)
+
+
+def replay_dv_validated(topo, scenario):
+    """Distance-vector failure timeline from an already-validated topology.
+
+    Mirrors :func:`replay_validated` so the command layer can enforce
+    topology-before-scenario precedence; here the scenario must also carry
+    an ``infinityMetric``.  The result is::
+
+        {"protocol": "distance-vector", "infinityMetric": ..., "timeline": ...}
+
+    Every timeline entry holds its converged synchronous rounds (round 0
+    plus each later changed round) and a ``convergenceRound`` pointer.  The
+    baseline entry has ``event: null``; event entries echo ``time`` and the
+    raw event verbatim.
+    """
+    events, infinity_metric = validate_dv_scenario(
+        topo, copy.deepcopy(scenario)
+    )
+
+    ordered_nodes = topo.nodes
+    state = NetworkState.initial(topo)
+    baseline_adjacency = state.active_adjacency()
+    baseline_rounds = distance_vector_failure_convergence(
+        initial_distance_vectors(ordered_nodes, baseline_adjacency),
+        ordered_nodes,
+        baseline_adjacency,
+        state.down_nodes,
+        infinity_metric,
+    )
+    timeline = [
+        {
+            "event": None,
+            "convergenceRound": baseline_rounds[-1]["round"],
+            "rounds": baseline_rounds,
+        }
+    ]
+
+    vectors = baseline_rounds[-1]["routers"]
+    for event in events:
+        state = apply_event(state, event)
+        active_adjacency = state.active_adjacency()
+        round_zero = distance_vector_failure_round_zero(
+            vectors, ordered_nodes, active_adjacency, state.down_nodes
+        )
+        rounds = distance_vector_failure_convergence(
+            round_zero,
+            ordered_nodes,
+            active_adjacency,
+            state.down_nodes,
+            infinity_metric,
+        )
+        vectors = rounds[-1]["routers"]
+        timeline.append(
+            {
+                "time": event.time,
+                "event": event.raw,
+                "convergenceRound": rounds[-1]["round"],
+                "rounds": rounds,
+            }
+        )
+    return {
+        "protocol": "distance-vector",
+        "infinityMetric": infinity_metric,
+        "timeline": timeline,
+    }
+
+
+def replay_dv_scenario(topology, scenario):
+    """Distance-vector failure timeline for a decoded topology and scenario.
+
+    Like :func:`replay_scenario`, every call starts from the fault-free
+    state and neither reads nor retains state from a previous call.
+    """
+    return replay_dv_validated(_validated(topology), scenario)

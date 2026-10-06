@@ -32,6 +32,9 @@ CONVERGE_USAGE = "usage: python3 -m packet_routing_sim converge TOPOLOGY.json\n"
 REPLAY_USAGE = (
     "usage: python3 -m packet_routing_sim replay TOPOLOGY.json SCENARIO.json\n"
 )
+REPLAY_DV_USAGE = (
+    "usage: python3 -m packet_routing_sim replay-dv TOPOLOGY.json SCENARIO.json\n"
+)
 USAGE = """usage: python3 -m packet_routing_sim <command>
 
 commands:
@@ -1005,6 +1008,408 @@ class TestReplayInvalidScenarios(unittest.TestCase):
                 self.assertEqual(proc.returncode, 2)
                 self.assertEqual(proc.stdout, b"")
                 self.assertEqual(proc.stderr, REPLAY_USAGE.encode())
+
+
+# ---------------------------------------------------------------------------
+# replay-dv: independent oracle, count-to-infinity trace, errors
+# ---------------------------------------------------------------------------
+
+
+DV_CHAIN = {
+    "nodes": ["A", "B", "C"],
+    "links": [link("A", "B", 1), link("B", "C", 1)],
+}
+
+
+def invoke_replay_dv(directory, topology, scenario, seed=0):
+    topo_path = write_topology(directory, topology)
+    scenario_path = write_scenario(directory, scenario)
+    return run_cli(
+        ["replay-dv", str(topo_path), str(scenario_path)], seed=seed
+    )
+
+
+def dv_round_zero_after(previous, nodes, active, down_nodes):
+    """Independent re-derivation of replay-dv's post-event round 0.
+
+    Online routers keep their prior advertisements, dropping only routes
+    whose next hop ceased to be an available direct neighbor; available
+    direct links always readvertise; a recovered router starts with no
+    reachable prior entries, leaving only itself and direct neighbors.
+    """
+    table = {}
+    for router in nodes:
+        if router in down_nodes:
+            table[router] = {dest: (None, None) for dest in nodes}
+            continue
+        row = {}
+        for dest in nodes:
+            if dest == router:
+                row[dest] = (None, 0)
+            elif dest in active[router]:
+                row[dest] = (dest, active[router][dest])
+            else:
+                hop, metric = previous[router, dest]
+                if hop is None or hop not in active[router]:
+                    row[dest] = (None, None)
+                else:
+                    row[dest] = (hop, metric)
+        table[router] = row
+    return {(r, d): table[r][d] for r in nodes for d in nodes}
+
+
+def dv_synchronous(previous, nodes, active, down_nodes, infinity_metric):
+    """Independent synchronous Bellman-Ford round with infinity clamping."""
+    current = {}
+    for router in nodes:
+        if router in down_nodes:
+            current.update({(router, d): (None, None) for d in nodes})
+            continue
+        for dest in nodes:
+            if dest == router:
+                current[router, dest] = (None, 0)
+                continue
+            best_cost, best_hop = None, None
+            for neighbor in sorted(active[router]):
+                advertised_cost = previous[neighbor, dest][1]
+                if advertised_cost is None:
+                    continue
+                cost = active[router][neighbor] + advertised_cost
+                if cost >= infinity_metric:
+                    continue
+                if best_cost is None or cost < best_cost:
+                    best_cost, best_hop = cost, neighbor
+            current[router, dest] = (
+                (None, None) if best_cost is None else (best_hop, best_cost)
+            )
+    return current
+
+
+def dv_expected_timeline(topology, scenario):
+    """Build the full normalized expected replay-dv timeline independently."""
+    nodes, adjacency = build_adjacency(topology)
+    infinity_metric = scenario["infinityMetric"]
+    down_nodes, down_links = set(), set()
+
+    def active_map():
+        disabled = {frozenset(p) for p in down_links}
+        active = {node: {} for node in nodes}
+        for source in nodes:
+            if source in down_nodes:
+                continue
+            for target, metric in adjacency[source].items():
+                if target in down_nodes:
+                    continue
+                if frozenset((source, target)) in disabled:
+                    continue
+                active[source][target] = metric
+        return active
+
+    def converge(initial):
+        rounds = [initial]
+        current = initial
+        while True:
+            updated = dv_synchronous(
+                current, nodes, active_map(), down_nodes, infinity_metric
+            )
+            if updated == current:
+                return rounds, current
+            current = updated
+            rounds.append(current)
+
+    # Fault-free baseline round 0 then synchronous convergence.
+    vectors = round_zero(nodes, active_map())
+    baseline_rounds, vectors = converge(vectors)
+    timeline = [(None, baseline_rounds)]
+
+    for event in scenario["events"]:
+        if event["action"] == "node-down":
+            down_nodes.add(event["node"])
+        elif event["action"] == "node-up":
+            down_nodes.discard(event["node"])
+        elif event["action"] == "link-down":
+            down_links.add(frozenset((event["from"], event["to"])))
+        else:
+            down_links.discard(frozenset((event["from"], event["to"])))
+        vectors = dv_round_zero_after(vectors, nodes, active_map(), down_nodes)
+        rounds, vectors = converge(vectors)
+        timeline.append((event["time"], rounds))
+    return timeline
+
+
+class TestReplayDV(unittest.TestCase):
+    def _apply_state(self, event, down_nodes, down_links):
+        action = event["action"]
+        if action == "node-down":
+            down_nodes.add(event["node"])
+        elif action == "node-up":
+            down_nodes.discard(event["node"])
+        elif action == "link-down":
+            down_links.add(frozenset((event["from"], event["to"])))
+        else:
+            down_links.discard(frozenset((event["from"], event["to"])))
+
+    def test_envelope_and_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_dv(
+                tmp, DV_CHAIN, {"infinityMetric": 8, "events": []}
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stderr, b"")
+            result = json.loads(proc.stdout)
+            self.assertEqual(
+                set(result), {"protocol", "infinityMetric", "timeline"}
+            )
+            self.assertEqual(result["protocol"], "distance-vector")
+            self.assertEqual(result["infinityMetric"], 8)
+            baseline = result["timeline"][0]
+            self.assertEqual(
+                set(baseline), {"event", "convergenceRound", "rounds"}
+            )
+            self.assertIsNone(baseline["event"])
+            self.assertEqual(
+                [r["round"] for r in baseline["rounds"]], [0, 1]
+            )
+            self.assertEqual(baseline["convergenceRound"], 1)
+
+    def test_timeline_matches_independent_oracle(self):
+        scenario = {
+            "infinityMetric": 30,
+            "events": list(REPLAY_SCENARIO),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_dv(tmp, DIAMOND, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            expected = dv_expected_timeline(DIAMOND, scenario)
+            self.assertEqual(len(result["timeline"]), len(expected))
+            for index, (entry, (expected_time, expected_rounds)) in enumerate(
+                zip(result["timeline"], expected)
+            ):
+                actual_rounds = entry["rounds"]
+                self.assertEqual(
+                    [r["round"] for r in actual_rounds],
+                    list(range(len(actual_rounds))),
+                    index,
+                )
+                self.assertEqual(
+                    entry["convergenceRound"],
+                    actual_rounds[-1]["round"],
+                    index,
+                )
+                for actual, want in zip(actual_rounds, expected_rounds):
+                    self.assertEqual(
+                        normalize(actual["routers"]), want, (index, actual["round"])
+                    )
+                if expected_time is None:
+                    self.assertIsNone(entry["event"])
+                else:
+                    self.assertEqual(entry["time"], expected_time)
+                    self.assertEqual(
+                        entry["event"], scenario["events"][index - 1]
+                    )
+
+    def test_hand_traced_count_to_infinity(self):
+        scenario = {
+            "infinityMetric": 8,
+            "events": [{"time": 1, "action": "node-down", "node": "C"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_dv(tmp, DV_CHAIN, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            rounds = json.loads(proc.stdout)["timeline"][1]["rounds"]
+            metrics = [
+                (r["routers"]["A"]["C"], r["routers"]["B"]["C"])
+                for r in rounds
+            ]
+            null = {"nextHop": None, "metric": None}
+            self.assertEqual(
+                metrics,
+                [
+                    ({"nextHop": "B", "metric": 2}, null),
+                    (null, {"nextHop": "A", "metric": 3}),
+                    ({"nextHop": "B", "metric": 4}, null),
+                    (null, {"nextHop": "A", "metric": 5}),
+                    ({"nextHop": "B", "metric": 6}, null),
+                    (null, {"nextHop": "A", "metric": 7}),
+                    (null, null),
+                ],
+            )
+            self.assertEqual(
+                json.loads(proc.stdout)["timeline"][1]["convergenceRound"], 6
+            )
+
+    def test_node_and_link_recovery_round_trips_to_shortest_paths(self):
+        scenario = {
+            "infinityMetric": 30,
+            "events": [
+                {"time": 1, "action": "node-down", "node": "C"},
+                {"time": 2, "action": "node-up", "node": "C"},
+                {"time": 3, "action": "link-down", "from": "A", "to": "B"},
+                {"time": 4, "action": "link-up", "from": "B", "to": "A"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_dv(tmp, DIAMOND, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            # Recovered link readvertises as a direct route at round 0.
+            recovered = result["timeline"][4]["rounds"][0]["routers"]
+            self.assertEqual(
+                recovered["A"]["B"], {"nextHop": "B", "metric": 1}
+            )
+            final = result["timeline"][-1]["rounds"][-1]["routers"]
+            compute = json.loads(
+                run_cli(
+                    ["compute", str(write_topology(tmp, DIAMOND, "t.json"))]
+                ).stdout
+            )
+            self.assertEqual(final, compute["routers"])
+
+    def test_down_router_whole_row_is_null(self):
+        scenario = {
+            "infinityMetric": 8,
+            "events": [{"time": 1, "action": "node-down", "node": "B"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_dv(tmp, DV_CHAIN, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            for snapshot in json.loads(proc.stdout)["timeline"][1]["rounds"]:
+                for dest in ("A", "B", "C"):
+                    self.assertEqual(
+                        snapshot["routers"]["B"][dest],
+                        {"nextHop": None, "metric": None},
+                    )
+
+    def test_empty_topology_and_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_dv(
+                tmp, EMPTY, {"infinityMetric": 1, "events": []}
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            self.assertEqual(result["infinityMetric"], 1)
+            self.assertEqual(
+                result["timeline"],
+                [
+                    {
+                        "event": None,
+                        "convergenceRound": 0,
+                        "rounds": [{"round": 0, "routers": {}}],
+                    }
+                ],
+            )
+
+    def test_byte_identity_across_seeds_and_declaration_order(self):
+        scenario = {"infinityMetric": 30, "events": list(REPLAY_SCENARIO)}
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs = set()
+            for seed in HASH_SEEDS:
+                for index, variant in enumerate(EQUIVALENT_VARIANTS):
+                    topo_path = write_topology(tmp, variant, f"v{index}.json")
+                    scen_path = write_scenario(
+                        tmp, scenario, f"s{index}.json"
+                    )
+                    proc = run_cli(
+                        ["replay-dv", str(topo_path), str(scen_path)],
+                        seed=seed,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    outputs.add(proc.stdout)
+            self.assertEqual(len(outputs), 1)
+
+
+class TestReplayDVInvalidScenarios(unittest.TestCase):
+    def _assert_invalid(self, directory, scenario):
+        proc = invoke_replay_dv(directory, CHAIN3, scenario)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, b"")
+        self.assertEqual(proc.stderr, b"invalid scenario\n")
+
+    def test_invalid_infinity_metric(self):
+        invalid = [
+            {},
+            {"events": []},
+            {"infinityMetric": None, "events": []},
+            {"infinityMetric": True, "events": []},
+            {"infinityMetric": 0, "events": []},
+            {"infinityMetric": -5, "events": []},
+            {"infinityMetric": 1.5, "events": []},
+            {"infinityMetric": "8", "events": []},
+            # CHAIN3's largest link metric is 7: must be strictly greater.
+            {"infinityMetric": 7, "events": []},
+            {"infinityMetric": 1, "events": []},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, scenario in enumerate(invalid):
+                with self.subTest(case=index):
+                    self._assert_invalid(tmp, scenario)
+
+    def test_event_errors_match_replay_conventions(self):
+        cases = [
+            {"infinityMetric": 50, "events": [None]},
+            {
+                "infinityMetric": 50,
+                "events": [
+                    {"time": 1, "action": "node-up", "node": "A"}
+                ],
+            },
+            {
+                "infinityMetric": 50,
+                "events": [
+                    {"time": 1, "action": "link-down", "from": "A", "to": "Z"}
+                ],
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, scenario in enumerate(cases):
+                with self.subTest(case=index):
+                    self._assert_invalid(tmp, scenario)
+
+    def test_unreadable_and_unparseable_scenario(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            topo_path = write_topology(tmp, CHAIN3)
+            missing = str(Path(tmp) / "nope.json")
+            proc = run_cli(["replay-dv", str(topo_path), missing])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(
+                proc.stderr, f"cannot read scenario: {missing}\n".encode()
+            )
+            broken = Path(tmp) / "broken.json"
+            broken.write_text("{bad", encoding="utf-8")
+            proc = run_cli(["replay-dv", str(topo_path), str(broken)])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(proc.stderr, b"invalid scenario\n")
+
+    def test_topology_errors_take_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_topo = str(Path(tmp) / "missing.json")
+            proc = run_cli(["replay-dv", missing_topo, "also-missing.json"])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(
+                proc.stderr, f"cannot read topology: {missing_topo}\n".encode()
+            )
+            bad_topo = write_topology(tmp, {"nodes": ["A", "A"], "links": []})
+            scen = write_scenario(tmp, {"infinityMetric": 1, "events": []})
+            proc = run_cli(["replay-dv", str(bad_topo), str(scen)])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(proc.stderr, b"invalid topology\n")
+
+    def test_argument_count_errors(self):
+        for args in (
+            ["replay-dv"],
+            ["replay-dv", "a.json"],
+            ["replay-dv", "a.json", "b.json", "c.json"],
+        ):
+            with self.subTest(args=args):
+                proc = run_cli(args)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, b"")
+                self.assertEqual(proc.stderr, REPLAY_DV_USAGE.encode())
 
 
 # ---------------------------------------------------------------------------

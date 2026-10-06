@@ -11,6 +11,7 @@ python3 -m packet_routing_sim version
 python3 -m packet_routing_sim compute TOPOLOGY.json
 python3 -m packet_routing_sim converge TOPOLOGY.json
 python3 -m packet_routing_sim replay TOPOLOGY.json SCENARIO.json
+python3 -m packet_routing_sim replay-dv TOPOLOGY.json SCENARIO.json
 python3 -m packet_routing_sim help
 ```
 
@@ -40,3 +41,29 @@ event's `time`, the `event` itself, and the recomputed link-state forwarding
 tables. All declared nodes always appear as routers and destinations; a down
 router's whole row is `null`/`null`, as is any entry for a down or
 unreachable destination.
+
+`replay-dv` reads the same topology and scenario format but replays the
+failures with synchronous distance-vector updates, showing the
+count-to-infinity process round by round. The scenario must additionally
+carry an `infinityMetric`: a non-boolean positive integer strictly greater
+than every declared link metric (otherwise the command reports
+`invalid scenario` and exits with status 2). Output is
+`{"protocol": "distance-vector", "infinityMetric": ..., "timeline": [...]}`.
+As with `replay`, the first timeline entry is the fault-free baseline with
+`event: null`; each later entry echoes the event's `time` and `event`
+verbatim. Every timeline entry contains a `rounds` list (round 0 plus each
+later round in which some route changes) and a `convergenceRound` pointer to
+the stable round.
+
+Round 0 after an event keeps each online router's previously advertised
+routes, except routes through a direct neighbor that just failed (or over a
+link that just went down) immediately become unreachable; a down router's
+whole row is unreachable; a recovering router starts knowing only itself and
+its currently available direct neighbors; and both endpoints of a recovered
+link regain the direct route at once. Subsequent rounds read only the
+previous round's advertisements from currently available neighbors, with no
+split horizon or poison reverse. A candidate metric at or above
+`infinityMetric` is reported as `null`/`null`, and ties on finite metric
+break to the smaller next-hop name. The recorded rounds make the rising
+metrics, alternating advertisements and final unreachability fully
+auditable.
