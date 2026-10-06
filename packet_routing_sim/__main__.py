@@ -7,6 +7,9 @@ from . import __version__
 
 COMPUTE_USAGE = "usage: python3 -m packet_routing_sim compute TOPOLOGY.json"
 CONVERGE_USAGE = "usage: python3 -m packet_routing_sim converge TOPOLOGY.json"
+REPLAY_USAGE = (
+    "usage: python3 -m packet_routing_sim replay TOPOLOGY.json SCENARIO.json"
+)
 
 USAGE = """usage: python3 -m packet_routing_sim <command>
 
@@ -16,6 +19,10 @@ commands:
                                 from a static undirected topology
   converge TOPOLOGY.json        show distance-vector convergence round
                                 by round from a static undirected topology
+  replay TOPOLOGY.json SCENARIO.json
+                                replay link and node failures over time and
+                                print the resulting link-state forwarding
+                                tables
   help                          print this message
 """
 
@@ -215,6 +222,183 @@ def run_converge(path):
     return 0
 
 
+def parse_scenario(scenario, declared, link_pairs):
+    """Validate a failure scenario against the original topology.
+
+    Returns a list of (time, action, state-key, event fields) tuples. The
+    state key is a node name or a canonical (sorted) link pair used to track
+    state; the event fields hold the node/link references in the orientation
+    originally given in the scenario. Returns None if the scenario is
+    malformed. Times must be positive integers strictly increasing; every
+    referenced node or link must exist in the original topology.
+    """
+    if not isinstance(scenario, dict):
+        return None
+    events_raw = scenario.get("events")
+    if not isinstance(events_raw, list):
+        return None
+
+    events = []
+    previous_time = 0
+    for event in events_raw:
+        if not isinstance(event, dict):
+            return None
+        time = event.get("time")
+        action = event.get("action")
+        if isinstance(time, bool) or not isinstance(time, int):
+            return None
+        if time <= previous_time:
+            return None
+        if not isinstance(action, str):
+            return None
+        if action in {"node-down", "node-up"}:
+            node = event.get("node")
+            if not isinstance(node, str) or node not in declared:
+                return None
+            key = node
+            fields = {"node": node}
+        elif action in {"link-down", "link-up"}:
+            source, target_end = event.get("from"), event.get("to")
+            if not isinstance(source, str) or not isinstance(target_end, str):
+                return None
+            if source not in declared or target_end not in declared:
+                return None
+            pair = (
+                (source, target_end)
+                if source < target_end
+                else (target_end, source)
+            )
+            if pair not in link_pairs:
+                return None
+            key = pair
+            fields = {"from": source, "to": target_end}
+        else:
+            return None
+        events.append((time, action, key, fields))
+        previous_time = time
+    return events
+
+
+def active_adjacency(ordered_nodes, adjacency, down_nodes, down_links):
+    """Restrict the original adjacency to links that currently carry traffic.
+
+    A link is active exactly when neither endpoint is down and it has not
+    been independently disabled by a link-down event.
+    """
+    active = {node: {} for node in ordered_nodes}
+    for node in ordered_nodes:
+        if node in down_nodes:
+            continue
+        for neighbor, metric in adjacency[node].items():
+            if neighbor in down_nodes:
+                continue
+            pair = (node, neighbor) if node < neighbor else (neighbor, node)
+            if pair in down_links:
+                continue
+            active[node][neighbor] = metric
+    return active
+
+
+def replay_tables(ordered_nodes, adjacency, down_nodes):
+    """Forwarding tables for one replay instant.
+
+    Down routers keep a full row of null entries; active routers run the
+    ordinary link-state computation over the currently active links.
+    """
+    routers = {}
+    for source in ordered_nodes:
+        if source in down_nodes:
+            routers[source] = {
+                destination: {"nextHop": None, "metric": None}
+                for destination in ordered_nodes
+            }
+        else:
+            routers[source] = forwarding_table(source, ordered_nodes, adjacency)
+    return routers
+
+
+def run_replay(topo_path, scenario_path):
+    parsed = load_topology(topo_path)
+    if isinstance(parsed, int):
+        return parsed
+    nodes, adjacency = parsed
+
+    try:
+        with open(scenario_path, "rb") as stream:
+            raw = stream.read()
+    except OSError:
+        print(f"cannot read scenario: {scenario_path}", file=sys.stderr)
+        return 2
+
+    try:
+        scenario = json.loads(raw)
+    except ValueError:
+        print("invalid scenario", file=sys.stderr)
+        return 2
+
+    link_pairs = {
+        (a, b) for a in nodes for b in adjacency[a] if a < b
+    }
+    events = parse_scenario(scenario, set(nodes), link_pairs)
+    if events is None:
+        print("invalid scenario", file=sys.stderr)
+        return 2
+
+    ordered_nodes = sorted(nodes)
+    down_nodes = set()
+    down_links = set()
+    current_adjacency = active_adjacency(
+        ordered_nodes, adjacency, down_nodes, down_links
+    )
+    timeline = [
+        {
+            "event": None,
+            "routers": replay_tables(
+                ordered_nodes, current_adjacency, down_nodes
+            ),
+        }
+    ]
+
+    for time, action, target, fields in events:
+        if action == "node-down":
+            if target in down_nodes:
+                print("invalid scenario", file=sys.stderr)
+                return 2
+            down_nodes.add(target)
+        elif action == "node-up":
+            if target not in down_nodes:
+                print("invalid scenario", file=sys.stderr)
+                return 2
+            down_nodes.remove(target)
+        elif action == "link-down":
+            if target in down_links:
+                print("invalid scenario", file=sys.stderr)
+                return 2
+            down_links.add(target)
+        else:
+            if target not in down_links:
+                print("invalid scenario", file=sys.stderr)
+                return 2
+            down_links.remove(target)
+
+        current_adjacency = active_adjacency(
+            ordered_nodes, adjacency, down_nodes, down_links
+        )
+        timeline.append(
+            {
+                "time": time,
+                "event": {"action": action, **fields},
+                "routers": replay_tables(
+                    ordered_nodes, current_adjacency, down_nodes
+                ),
+            }
+        )
+
+    output = {"protocol": "link-state", "timeline": timeline}
+    sys.stdout.write(json.dumps(output, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     command = args[0] if args else "help"
@@ -231,6 +415,11 @@ def main(argv: list[str] | None = None) -> int:
             print(CONVERGE_USAGE, file=sys.stderr)
             return 2
         return run_converge(args[1])
+    if command == "replay":
+        if len(args) != 3:
+            print(REPLAY_USAGE, file=sys.stderr)
+            return 2
+        return run_replay(args[1], args[2])
     if command in {"help", "-h", "--help"}:
         print(USAGE, end="")
         return 0
