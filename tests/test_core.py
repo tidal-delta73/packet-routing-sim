@@ -31,7 +31,9 @@ from packet_routing_sim.core import (
     apply_event,
     compute_topology,
     converge_topology,
+    replay_dv_scenario,
     replay_scenario,
+    validate_dv_scenario,
     validate_scenario,
     validate_topology,
 )
@@ -272,6 +274,421 @@ class TestFailureStateRules(unittest.TestCase):
         after = apply_event(before, events[0])
         self.assertEqual(before.down_links, frozenset())
         self.assertEqual(after.down_links, frozenset({("A", "B")}))
+
+
+# ---------------------------------------------------------------------------
+# Distance-vector failure replay
+# ---------------------------------------------------------------------------
+
+
+DV_CHAIN = {
+    "nodes": ["A", "B", "C"],
+    "links": [link("A", "B", 5), link("B", "C", 7)],
+}
+DV_DIAMOND = {
+    "nodes": ["A", "B", "C", "D"],
+    "links": [
+        link("A", "B", 1),
+        link("A", "C", 1),
+        link("B", "D", 1),
+        link("C", "D", 1),
+    ],
+}
+UNREACHABLE = {"nextHop": None, "metric": None}
+
+
+def dv_entries(item):
+    """Flatten one replay-dv timeline item to {round: {(r, d): entry}}."""
+    return {
+        snapshot["round"]: {
+            (router, dest): entry
+            for router, row in snapshot["routers"].items()
+            for dest, entry in row.items()
+        }
+        for snapshot in item["rounds"]
+    }
+
+
+class TestDistanceVectorReplay(unittest.TestCase):
+    def test_top_level_and_item_shape(self):
+        result = replay_dv_scenario(
+            DV_CHAIN,
+            {
+                "infinityMetric": 100,
+                "events": [
+                    {"time": 1, "action": "link-down", "from": "B", "to": "C"}
+                ],
+            },
+        )
+        self.assertEqual(set(result), {"protocol", "infinityMetric", "timeline"})
+        self.assertEqual(result["protocol"], "distance-vector")
+        self.assertEqual(result["infinityMetric"], 100)
+        timeline = result["timeline"]
+        self.assertEqual(len(timeline), 2)
+        self.assertEqual(set(timeline[0]), {"event", "convergenceRound", "rounds"})
+        self.assertIsNone(timeline[0]["event"])
+        self.assertNotIn("time", timeline[0])
+        event_item = timeline[1]
+        self.assertEqual(
+            set(event_item), {"time", "event", "convergenceRound", "rounds"}
+        )
+        for item in timeline:
+            rounds = item["rounds"]
+            self.assertEqual(
+                [snapshot["round"] for snapshot in rounds],
+                list(range(len(rounds))),
+            )
+            self.assertEqual(item["convergenceRound"], rounds[-1]["round"])
+            for snapshot in rounds:
+                self.assertEqual(set(snapshot), {"round", "routers"})
+
+    def test_baseline_round_zero_starts_from_self_and_direct_neighbors(self):
+        item = replay_dv_scenario(
+            DV_CHAIN, {"infinityMetric": 100, "events": []}
+        )["timeline"][0]
+        round_zero = item["rounds"][0]["routers"]
+        self.assertEqual(round_zero["A"]["A"], {"nextHop": None, "metric": 0})
+        self.assertEqual(round_zero["A"]["B"], {"nextHop": "B", "metric": 5})
+        self.assertEqual(round_zero["A"]["C"], UNREACHABLE)
+        self.assertEqual(round_zero["C"]["A"], UNREACHABLE)
+
+    def test_baseline_converges_to_shortest_paths_like_converge(self):
+        replay = replay_dv_scenario(
+            DV_CHAIN, {"infinityMetric": 100, "events": []}
+        )
+        converge = converge_topology(DV_CHAIN)
+        baseline = replay["timeline"][0]
+        self.assertEqual(baseline["convergenceRound"], 1)
+        self.assertEqual(
+            baseline["rounds"][-1]["routers"],
+            converge["rounds"][-1]["routers"],
+        )
+
+    def test_empty_and_isolated_topologies_converge_at_round_zero(self):
+        empty = replay_dv_scenario(
+            EMPTY, {"infinityMetric": 1, "events": []}
+        )
+        self.assertEqual(
+            empty,
+            {
+                "protocol": "distance-vector",
+                "infinityMetric": 1,
+                "timeline": [
+                    {
+                        "event": None,
+                        "convergenceRound": 0,
+                        "rounds": [{"round": 0, "routers": {}}],
+                    }
+                ],
+            },
+        )
+        isolated = replay_dv_scenario(
+            {"nodes": ["x", "y"], "links": []},
+            {"infinityMetric": 3, "events": []},
+        )["timeline"][0]
+        self.assertEqual(isolated["convergenceRound"], 0)
+        routers = isolated["rounds"][0]["routers"]
+        self.assertEqual(routers["x"]["x"], {"nextHop": None, "metric": 0})
+        self.assertEqual(routers["x"]["y"], UNREACHABLE)
+
+    def test_counting_to_infinity_trace_on_link_failure(self):
+        result = replay_dv_scenario(
+            DV_CHAIN,
+            {
+                "infinityMetric": 100,
+                "events": [
+                    {"time": 1, "action": "link-down", "from": "B", "to": "C"}
+                ],
+            },
+        )
+        item = result["timeline"][1]
+        rounds = dv_entries(item)
+        # Round 0: B's direct route via the failed neighbor C is gone at
+        # once; A still believes its route via B (metric 12).
+        self.assertEqual(rounds[0][("A", "C")], {"nextHop": "B", "metric": 12})
+        self.assertEqual(rounds[0][("B", "C")], UNREACHABLE)
+        # Alternating advertisements inflate the metric by one link cost
+        # per round: odd rounds B points at A, even rounds A at B.
+        for index in range(1, 18):
+            if index % 2 == 1:
+                self.assertEqual(
+                    rounds[index][("A", "C")],
+                    UNREACHABLE,
+                    f"round {index}",
+                )
+                self.assertEqual(
+                    rounds[index][("B", "C")],
+                    {"nextHop": "A", "metric": 12 + 5 * index},
+                    f"round {index}",
+                )
+            else:
+                self.assertEqual(
+                    rounds[index][("A", "C")],
+                    {"nextHop": "B", "metric": 12 + 5 * index},
+                    f"round {index}",
+                )
+                self.assertEqual(
+                    rounds[index][("B", "C")], UNREACHABLE, f"round {index}"
+                )
+        # Round 18: the last candidate (102) reaches infinity, both give up.
+        self.assertEqual(rounds[18][("A", "C")], UNREACHABLE)
+        self.assertEqual(rounds[18][("B", "C")], UNREACHABLE)
+        self.assertEqual(item["convergenceRound"], 18)
+        self.assertEqual(len(item["rounds"]), 19)
+
+    def test_node_failure_matches_link_failure_counting_and_nulls_row(self):
+        result = replay_dv_scenario(
+            DV_CHAIN,
+            {
+                "infinityMetric": 16,
+                "events": [
+                    {"time": 1, "action": "node-down", "node": "C"}
+                ],
+            },
+        )
+        item = result["timeline"][1]
+        rounds = dv_entries(item)
+        # B's route via the now-failed direct neighbor C is null at round 0,
+        # while A retains its prior advertisement via B.
+        self.assertEqual(rounds[0][("B", "C")], UNREACHABLE)
+        self.assertEqual(rounds[0][("A", "C")], {"nextHop": "B", "metric": 12})
+        # The failed router's whole row -- including its self entry -- is
+        # unreachable in every recorded round.
+        for snapshot in item["rounds"]:
+            for entry in snapshot["routers"]["C"].values():
+                self.assertEqual(entry, UNREACHABLE)
+        # infinityMetric 16: A adopts nothing at round 1 (5+12 = 17 >= 16),
+        # B likewise has no usable advertisement, so round 1 is the fixpoint.
+        self.assertEqual(item["convergenceRound"], 1)
+        self.assertEqual(
+            dv_entries(item)[1][("A", "C")], UNREACHABLE
+        )
+
+    def test_recovered_router_cold_starts_with_only_direct_neighbors(self):
+        result = replay_dv_scenario(
+            DV_CHAIN,
+            {
+                "infinityMetric": 100,
+                "events": [
+                    {"time": 1, "action": "node-down", "node": "C"},
+                    {"time": 2, "action": "node-up", "node": "C"},
+                ],
+            },
+        )
+        item = result["timeline"][2]
+        round_zero = item["rounds"][0]["routers"]
+        # C knows only itself and its currently usable direct neighbor B.
+        self.assertEqual(round_zero["C"]["C"], {"nextHop": None, "metric": 0})
+        self.assertEqual(round_zero["C"]["B"], {"nextHop": "B", "metric": 7})
+        self.assertEqual(round_zero["C"]["A"], UNREACHABLE)
+        # B's direct route over the recovered adjacency is back at once;
+        # A still has to hear the news through B.
+        self.assertEqual(round_zero["B"]["C"], {"nextHop": "C", "metric": 7})
+        self.assertEqual(round_zero["A"]["C"], UNREACHABLE)
+        # One synchronous exchange later the network reconverges.
+        final = item["rounds"][-1]["routers"]
+        self.assertEqual(item["convergenceRound"], 1)
+        self.assertEqual(final["A"]["C"], {"nextHop": "B", "metric": 12})
+        self.assertEqual(final["C"]["A"], {"nextHop": "B", "metric": 12})
+
+    def test_recovered_link_reinstalls_direct_routes_at_both_ends(self):
+        result = replay_dv_scenario(
+            DV_CHAIN,
+            {
+                "infinityMetric": 100,
+                "events": [
+                    {"time": 1, "action": "link-down", "from": "B", "to": "C"},
+                    {"time": 2, "action": "link-up", "from": "C", "to": "B"},
+                ],
+            },
+        )
+        round_zero = result["timeline"][2]["rounds"][0]["routers"]
+        self.assertEqual(round_zero["B"]["C"], {"nextHop": "C", "metric": 7})
+        self.assertEqual(round_zero["C"]["B"], {"nextHop": "B", "metric": 7})
+
+    def test_explicit_link_down_survives_node_recovery(self):
+        result = replay_dv_scenario(
+            DV_CHAIN,
+            {
+                "infinityMetric": 100,
+                "events": [
+                    {"time": 1, "action": "link-down", "from": "A", "to": "B"},
+                    {"time": 2, "action": "node-down", "node": "B"},
+                    {"time": 3, "action": "node-up", "node": "B"},
+                ],
+            },
+        )
+        item = result["timeline"][3]
+        routers = item["rounds"][-1]["routers"]
+        # B is back (cold) but the explicitly disabled A-B link stays down,
+        # so A stays isolated and B only reaches C.
+        self.assertEqual(routers["A"]["B"], UNREACHABLE)
+        self.assertEqual(routers["A"]["C"], UNREACHABLE)
+        self.assertEqual(routers["B"]["A"], UNREACHABLE)
+        self.assertEqual(routers["B"]["C"], {"nextHop": "C", "metric": 7})
+
+    def test_tied_finite_metrics_pick_smaller_next_hop_name(self):
+        item = replay_dv_scenario(
+            DV_DIAMOND, {"infinityMetric": 10, "events": []}
+        )["timeline"][0]
+        final = item["rounds"][-1]["routers"]
+        self.assertEqual(final["A"]["D"], {"nextHop": "B", "metric": 2})
+        self.assertEqual(final["D"]["A"], {"nextHop": "B", "metric": 2})
+
+    def test_events_are_echoed_verbatim_and_chain_in_order(self):
+        events = [
+            {"time": 3, "action": "link-down", "from": "A", "to": "B"},
+            {"time": 7, "action": "node-down", "node": "C"},
+        ]
+        timeline = replay_dv_scenario(
+            DV_DIAMOND, {"infinityMetric": 50, "events": events}
+        )["timeline"]
+        self.assertEqual(len(timeline), 3)
+        for index, event in enumerate(events, start=1):
+            self.assertEqual(timeline[index]["time"], event["time"])
+            self.assertEqual(timeline[index]["event"], event)
+
+    def test_infinity_metric_validation(self):
+        valid_topo = DV_CHAIN  # link metrics 5 and 7; maximum 7
+        for bad in (
+            {},  # missing
+            None,
+            True,
+            False,
+            0,
+            -1,
+            1.5,
+            "8",
+            [8],
+            7,   # equal to the largest link metric: not strictly greater
+            5,   # below a link metric
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(InvalidScenario):
+                    replay_dv_scenario(valid_topo, {"infinityMetric": bad})
+        # Strictly above every link metric is accepted; one above is enough.
+        events, infinity = validate_dv_scenario(
+            validate_topology(valid_topo),
+            {"infinityMetric": 8, "events": []},
+        )
+        self.assertEqual(infinity, 8)
+        self.assertEqual(events, ())
+        # A linkless topology accepts infinityMetric 1.
+        replay_dv_scenario(
+            {"nodes": ["solo"], "links": []},
+            {"infinityMetric": 1, "events": []},
+        )
+
+    def test_event_rules_and_transitions_are_still_enforced(self):
+        with self.assertRaises(InvalidStateTransition):
+            replay_dv_scenario(
+                DV_CHAIN,
+                {
+                    "infinityMetric": 8,
+                    "events": [
+                        {"time": 1, "action": "node-up", "node": "A"}
+                    ],
+                },
+            )
+        with self.assertRaises(InvalidStateTransition):
+            replay_dv_scenario(
+                DV_CHAIN,
+                {
+                    "infinityMetric": 8,
+                    "events": [
+                        {"time": 1, "action": "link-down", "from": "A", "to": "B"},
+                        {"time": 2, "action": "link-down", "from": "B", "to": "A"},
+                    ],
+                },
+            )
+        with self.assertRaises(InvalidScenario):
+            replay_dv_scenario(
+                DV_CHAIN,
+                {
+                    "infinityMetric": 8,
+                    "events": [
+                        {"time": 1, "action": "explode", "node": "A"}
+                    ],
+                },
+            )
+
+    def test_topology_errors_take_precedence_over_scenario_errors(self):
+        with self.assertRaises(InvalidTopology):
+            replay_dv_scenario(
+                {"nodes": ["A", "A"], "links": []},
+                {"infinityMetric": True},
+            )
+
+    def test_link_state_replay_ignores_infinity_field(self):
+        # The new optional field must not change link-state replay at all.
+        without = replay_scenario(DV_CHAIN, {"events": []})
+        with_field = replay_scenario(
+            DV_CHAIN, {"events": [], "infinityMetric": "ignored"}
+        )
+        self.assertEqual(with_field, without)
+
+    def test_inputs_are_not_mutated_and_state_does_not_leak(self):
+        topology = copy.deepcopy(DV_CHAIN)
+        scenario = {
+            "infinityMetric": 100,
+            "events": [
+                {"time": 1, "action": "node-down", "node": "C"}
+            ],
+        }
+        topo_before = copy.deepcopy(topology)
+        scen_before = copy.deepcopy(scenario)
+        replay_dv_scenario(topology, scenario)
+        self.assertEqual(topology, topo_before)
+        self.assertEqual(scenario, scen_before)
+
+        faulted = replay_dv_scenario(topology, scenario)
+        again = replay_dv_scenario(
+            topology, {"infinityMetric": 100, "events": []}
+        )
+        # A fresh call starts fault-free and reconverges to shortest paths.
+        baseline_final = again["timeline"][0]["rounds"][-1]["routers"]
+        self.assertEqual(
+            baseline_final["A"]["C"], {"nextHop": "B", "metric": 12}
+        )
+        self.assertEqual(
+            replay_dv_scenario(topology, copy.deepcopy(scenario)), faulted
+        )
+
+    def test_mutating_a_result_cannot_pollute_later_calls(self):
+        scenario = {
+            "infinityMetric": 100,
+            "events": [
+                {"time": 1, "action": "link-down", "from": "B", "to": "C"}
+            ],
+        }
+        first = replay_dv_scenario(DV_CHAIN, scenario)
+        first["timeline"][1]["rounds"][0]["routers"]["A"]["C"] = {
+            "nextHop": "HACKED",
+            "metric": -999,
+        }
+        first["timeline"][1]["event"]["from"] = "Z"
+        second = replay_dv_scenario(DV_CHAIN, scenario)
+        self.assertEqual(
+            second["timeline"][1]["rounds"][0]["routers"]["A"]["C"],
+            {"nextHop": "B", "metric": 12},
+        )
+        self.assertEqual(second["timeline"][1]["event"]["from"], "B")
+        # The echoed event is a copy, not the caller's dict.
+        self.assertIsNot(
+            second["timeline"][1]["event"], scenario["events"][0]
+        )
+
+    def test_result_is_plain_json_serialisable(self):
+        result = replay_dv_scenario(
+            DV_CHAIN,
+            {
+                "infinityMetric": 100,
+                "events": [
+                    {"time": 1, "action": "link-down", "from": "B", "to": "C"}
+                ],
+            },
+        )
+        json.loads(json.dumps(result))
 
 
 # ---------------------------------------------------------------------------

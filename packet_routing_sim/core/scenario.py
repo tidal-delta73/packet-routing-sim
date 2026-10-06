@@ -6,6 +6,11 @@ strictly increasing positive integer times, and legal state transitions
 transition check is performed by folding :func:`state.apply_event` over the
 events from a fault-free state, so replay and any future protocol reuse one
 authoritative set of event rules rather than a copied second copy.
+
+Distance-vector replays additionally require an ``infinityMetric``: a
+non-boolean positive integer strictly larger than every topology link
+metric.  Link-state replay ignores that field, keeping one shared event
+vocabulary for both protocols.
 """
 from dataclasses import dataclass
 
@@ -40,19 +45,33 @@ def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def validate_scenario(topology, scenario):
-    """Validate a decoded scenario against a validated topology.
+def _validate_scenario_parts(topology, scenario, require_infinity):
+    """Shared validation for both replay protocols.
 
-    Return a tuple of immutable :class:`Event` records in time order.  Raise
-    :class:`InvalidScenario` for malformed structure or values, and its
-    subclass :class:`InvalidStateTransition` for an otherwise well-formed
-    event that cannot be applied from the preceding state.
+    Always validates the event list (folding the state-transition rules over
+    it).  When ``require_infinity`` is true also validates ``infinityMetric``
+    as a non-boolean positive integer strictly larger than every topology
+    link metric.  Returns ``(events, infinity)`` where ``infinity`` is the
+    validated metric or ``None``.
     """
     if not isinstance(scenario, dict):
         raise InvalidScenario("scenario must be an object")
     events_raw = scenario.get("events")
     if not isinstance(events_raw, list):
         raise InvalidScenario("events must be an array")
+
+    infinity = None
+    if require_infinity:
+        value = scenario.get("infinityMetric")
+        if not _is_int(value) or value <= 0:
+            raise InvalidScenario(
+                "infinityMetric must be a positive integer"
+            )
+        if any(value <= metric for _pair, metric in topology.links):
+            raise InvalidScenario(
+                "infinityMetric must exceed every link metric"
+            )
+        infinity = value
 
     node_set = topology.node_set
     known_links = topology.link_pairs
@@ -99,4 +118,25 @@ def validate_scenario(topology, scenario):
         events.append(event)
         last_time = time
 
-    return tuple(events)
+    return tuple(events), infinity
+
+
+def validate_scenario(topology, scenario):
+    """Validate a decoded scenario against a validated topology.
+
+    Return a tuple of immutable :class:`Event` records in time order.  Raise
+    :class:`InvalidScenario` for malformed structure or values, and its
+    subclass :class:`InvalidStateTransition` for an otherwise well-formed
+    event that cannot be applied from the preceding state.
+    """
+    return _validate_scenario_parts(topology, scenario, False)[0]
+
+
+def validate_dv_scenario(topology, scenario):
+    """Like :func:`validate_scenario`, additionally validating infinity.
+
+    Distance-vector replay requires ``infinityMetric`` to be a non-boolean
+    positive integer strictly larger than every link metric.  Returns
+    ``(events, infinity)``.
+    """
+    return _validate_scenario_parts(topology, scenario, True)

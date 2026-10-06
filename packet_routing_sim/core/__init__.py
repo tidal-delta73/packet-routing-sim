@@ -4,7 +4,8 @@ Public entry points:
 
 * :func:`compute_topology`  -> ``{"routers": ...}``
 * :func:`converge_topology` -> ``{"protocol", "convergenceRound", "rounds"}``
-* :func:`replay_scenario`   -> ``{"protocol", "timeline"}``
+* :func:`replay_scenario`   -> ``{"protocol", "timeline"}`` (link state)
+* :func:`replay_dv_scenario` -> ``{"protocol", "infinityMetric", "timeline"}``
 
 Each entry point takes already-decoded JSON values (plain ``dict``/``list``/
 ``str``/``int``) and returns fresh plain-Python data.  The core performs no
@@ -33,12 +34,15 @@ from .errors import (
     SimulationError,
 )
 from .routing import (
+    distance_vector_bounded_convergence,
     distance_vector_convergence,
+    distance_vector_event_round,
     forwarding_table,
+    initial_distance_vectors,
     link_state_snapshot,
 )
-from .scenario import validate_scenario
-from .state import NetworkState, apply_event
+from .scenario import validate_dv_scenario, validate_scenario
+from .state import NODE_UP, NetworkState, apply_event
 from .topology import Topology, validate_topology
 
 __all__ = [
@@ -46,9 +50,12 @@ __all__ = [
     "converge_topology",
     "replay_scenario",
     "replay_validated",
+    "replay_dv_scenario",
+    "replay_dv_validated",
     "snapshot_state",
     "validate_topology",
     "validate_scenario",
+    "validate_dv_scenario",
     "Topology",
     "NetworkState",
     "apply_event",
@@ -125,3 +132,69 @@ def replay_scenario(topology, scenario):
     and link availability.
     """
     return replay_validated(_validated(topology), scenario)
+
+
+def replay_dv_validated(topo, scenario):
+    """Distance-vector failure timeline from an already-validated topology.
+
+    Mirrors :func:`replay_validated` (so the command layer keeps
+    topology-before-scenario precedence) but runs the synchronous
+    distance-vector protocol with an explicit infinity metric.  Every
+    timeline item records the item's own round 0 plus every later round that
+    changed, through that item's fixed point; ``convergenceRound`` names the
+    stable round.
+    """
+    events, infinity = validate_dv_scenario(topo, copy.deepcopy(scenario))
+    ordered_nodes = topo.nodes
+
+    state = NetworkState.initial(topo)
+    active = state.active_adjacency()
+    vectors = initial_distance_vectors(ordered_nodes, active)
+    item_rounds = distance_vector_bounded_convergence(
+        ordered_nodes, vectors, active, infinity, state.down_nodes
+    )
+    timeline = [{"event": None, "convergenceRound": item_rounds[-1]["round"],
+                 "rounds": item_rounds}]
+    for event in events:
+        # Each event happens after the previous item converged: start its
+        # round 0 from the stable vectors, not from the prior item's round 0.
+        vectors = item_rounds[-1]["routers"]
+        state = apply_event(state, event)
+        active = state.active_adjacency()
+        recovered = (
+            frozenset({event.node})
+            if event.action == NODE_UP
+            else frozenset()
+        )
+        vectors = distance_vector_event_round(
+            vectors,
+            ordered_nodes,
+            active,
+            state.down_nodes,
+            recovered,
+        )
+        item_rounds = distance_vector_bounded_convergence(
+            ordered_nodes, vectors, active, infinity, state.down_nodes
+        )
+        timeline.append(
+            {
+                "time": event.time,
+                "event": event.raw,
+                "convergenceRound": item_rounds[-1]["round"],
+                "rounds": item_rounds,
+            }
+        )
+    return {
+        "protocol": "distance-vector",
+        "infinityMetric": infinity,
+        "timeline": timeline,
+    }
+
+
+def replay_dv_scenario(topology, scenario):
+    """Distance-vector failure timeline for a decoded topology and scenario.
+
+    Always begins from the fault-free state; failure state never carries over
+    from a previous call and the supplied inputs are never mutated.
+    """
+    return replay_dv_validated(_validated(topology), scenario)
