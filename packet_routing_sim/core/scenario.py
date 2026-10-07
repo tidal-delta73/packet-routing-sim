@@ -45,7 +45,11 @@ def validate_dv_scenario(topology, scenario):
 
     Beyond the shared event rules the scenario must carry an
     ``infinityMetric``: a non-boolean positive integer strictly greater
-    than every declared link metric.  Return ``(events, infinity_metric)``.
+    than every declared link metric.  It may optionally carry
+    ``holdDownRounds``: a non-boolean non-negative integer selecting route
+    hold-down after failure events; omission (``None``) preserves the legacy
+    behavior byte-for-byte, while ``0`` explicitly disables suppression.
+    Return ``(events, infinity_metric, hold_down_rounds)``.
     """
     if not isinstance(scenario, dict):
         raise InvalidScenario("scenario must be an object")
@@ -59,7 +63,15 @@ def validate_dv_scenario(topology, scenario):
         raise InvalidScenario(
             "infinityMetric must exceed every link metric"
         )
-    return _validate_events(topology, scenario), infinity_metric
+    if "holdDownRounds" in scenario:
+        hold_down_rounds = scenario["holdDownRounds"]
+        if not _is_int(hold_down_rounds) or hold_down_rounds < 0:
+            raise InvalidScenario(
+                "holdDownRounds must be a non-negative integer"
+            )
+    else:
+        hold_down_rounds = None
+    return _validate_events(topology, scenario), infinity_metric, hold_down_rounds
 
 
 def _validate_events(topology, scenario):

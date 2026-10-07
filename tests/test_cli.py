@@ -1411,6 +1411,77 @@ class TestReplayDVInvalidScenarios(unittest.TestCase):
                 self.assertEqual(proc.stdout, b"")
                 self.assertEqual(proc.stderr, REPLAY_DV_USAGE.encode())
 
+    def test_holddown_is_echoed_and_recorded_round_by_round(self):
+        scenario = {
+            "infinityMetric": 8,
+            "holdDownRounds": 2,
+            "events": [{"time": 1, "action": "node-down", "node": "C"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_dv(tmp, DV_CHAIN, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            self.assertEqual(result["holdDownRounds"], 2)
+            entry = result["timeline"][1]
+            rounds = entry["rounds"]
+            # round 0 timer, round 1 counting, round 2 released.
+            self.assertEqual(rounds[0]["holdDowns"]["B"], {"C": 2})
+            self.assertEqual(rounds[1]["holdDowns"]["B"], {"C": 1})
+            self.assertEqual(rounds[2]["holdDowns"]["B"], {})
+            self.assertEqual(entry["convergenceRound"], 2)
+            # Baseline holds only empty maps.
+            for snapshot in result["timeline"][0]["rounds"]:
+                self.assertEqual(
+                    snapshot["holdDowns"], {"A": {}, "B": {}, "C": {}}
+                )
+
+    def test_holddown_zero_or_omitted_output_is_identical(self):
+        events = [{"time": 1, "action": "node-down", "node": "C"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            omitted = invoke_replay_dv(
+                tmp, DV_CHAIN, {"infinityMetric": 8, "events": events}
+            )
+            zero = invoke_replay_dv(
+                tmp,
+                DV_CHAIN,
+                {"infinityMetric": 8, "holdDownRounds": 0, "events": events},
+            )
+            self.assertEqual(omitted.returncode, 0, omitted.stderr)
+            self.assertEqual(zero.returncode, 0, zero.stderr)
+            self.assertEqual(omitted.stdout, zero.stdout)
+
+    def test_invalid_holddown_values(self):
+        invalid = [True, False, -1, 1.5, "2", [2], {"x": 2}, None]
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, value in enumerate(invalid):
+                scenario = {
+                    "infinityMetric": 8, "holdDownRounds": value, "events": []
+                }
+                with self.subTest(case=index):
+                    self._assert_invalid(tmp, scenario)
+
+    def test_holddown_byte_identity_across_seeds_and_declaration_order(self):
+        scenario = {
+            "infinityMetric": 30,
+            "holdDownRounds": 3,
+            "events": list(REPLAY_SCENARIO),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs = set()
+            for seed in HASH_SEEDS:
+                for index, variant in enumerate(EQUIVALENT_VARIANTS):
+                    topo_path = write_topology(tmp, variant, f"v{index}.json")
+                    scen_path = write_scenario(
+                        tmp, scenario, f"s{index}.json"
+                    )
+                    proc = run_cli(
+                        ["replay-dv", str(topo_path), str(scen_path)],
+                        seed=seed,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    outputs.add(proc.stdout)
+            self.assertEqual(len(outputs), 1)
+
 
 # ---------------------------------------------------------------------------
 # replay-ls: independent neighbor-discovery/LSA-flooding/SPF oracle

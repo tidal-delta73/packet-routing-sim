@@ -47,6 +47,9 @@ from .routing import (
     distance_vector_convergence,
     distance_vector_failure_convergence,
     distance_vector_failure_round_zero,
+    distance_vector_holddown_convergence,
+    distance_vector_holddown_round,
+    distance_vector_holddown_round_zero,
     forwarding_table,
     initial_distance_vectors,
     link_state_snapshot,
@@ -64,6 +67,10 @@ __all__ = [
     "replay_ls_validated",
     "replay_dv_scenario",
     "replay_dv_validated",
+    "distance_vector_holddown_round",
+    "distance_vector_holddown_round_zero",
+    "distance_vector_holddown_convergence",
+    "holddowns_public",
     "snapshot_state",
     "validate_topology",
     "validate_scenario",
@@ -239,16 +246,27 @@ def replay_dv_validated(topo, scenario):
 
     Mirrors :func:`replay_validated` so the command layer can enforce
     topology-before-scenario precedence; here the scenario must also carry
-    an ``infinityMetric``.  The result is::
+    an ``infinityMetric`` and may carry ``holdDownRounds``.
+
+    Without ``holdDownRounds`` the result is byte-for-byte the legacy
+    document::
 
         {"protocol": "distance-vector", "infinityMetric": ..., "timeline": ...}
 
+    With ``holdDownRounds`` the root echoes it and every round of every
+    timeline entry additionally carries ``holdDowns`` (a router ->
+    destination -> remaining-rounds map, ``{}`` when no timer is live)::
+
+        {"protocol": "distance-vector", "infinityMetric": ...,
+         "holdDownRounds": ..., "timeline": ...}
+
     Every timeline entry holds its converged synchronous rounds (round 0
-    plus each later changed round) and a ``convergenceRound`` pointer.  The
-    baseline entry has ``event: null``; event entries echo ``time`` and the
-    raw event verbatim.
+    plus each later changed round) and a ``convergenceRound`` pointer, which
+    under hold-down points at the last round in which either a forwarding
+    vector or a hold-down timer still changed.  The baseline entry has
+    ``event: null``; event entries echo ``time`` and the raw event verbatim.
     """
-    events, infinity_metric = validate_dv_scenario(
+    events, infinity_metric, hold_down_rounds = validate_dv_scenario(
         topo, copy.deepcopy(scenario)
     )
 
@@ -262,6 +280,28 @@ def replay_dv_validated(topo, scenario):
         state.down_nodes,
         infinity_metric,
     )
+
+    if not hold_down_rounds:
+        # Omission preserves the legacy result; an explicit 0 is defined to
+        # disable suppression entirely, so it shares the identical path.
+        return _replay_dv_legacy(
+            topo, events, ordered_nodes, infinity_metric, baseline_rounds, state
+        )
+    return _replay_dv_holddown(
+        topo,
+        events,
+        ordered_nodes,
+        infinity_metric,
+        hold_down_rounds,
+        baseline_rounds,
+        state,
+    )
+
+
+def _replay_dv_legacy(
+    topo, events, ordered_nodes, infinity_metric, baseline_rounds, state
+):
+    """The original hold-down-free replay, unchanged in every byte."""
     timeline = [
         {
             "event": None,
@@ -296,6 +336,80 @@ def replay_dv_validated(topo, scenario):
     return {
         "protocol": "distance-vector",
         "infinityMetric": infinity_metric,
+        "timeline": timeline,
+    }
+
+
+def _rounds_with_empty_holddowns(rounds, ordered_nodes):
+    """Fresh copy of legacy-style rounds carrying an empty ``holdDowns`` map."""
+    empty = {router: {} for router in ordered_nodes}
+    return [
+        {
+            "round": snapshot["round"],
+            "routers": snapshot["routers"],
+            "holdDowns": {router: dict(empty[router]) for router in ordered_nodes},
+        }
+        for snapshot in rounds
+    ]
+
+
+def _replay_dv_holddown(
+    topo,
+    events,
+    ordered_nodes,
+    infinity_metric,
+    hold_down_rounds,
+    baseline_rounds,
+    state,
+):
+    """Replay in which failure-invalidated routes are held down briefly.
+
+    The fault-free baseline never invalidates a finite route, so its rounds
+    carry empty hold-down maps and exactly the legacy forwarding vectors.
+    Each event after the baseline builds its round zero from the previous
+    converged vectors (whose hold-down timers have all expired by then) and
+    runs the synchronous hold-down convergence.
+    """
+    timeline = [
+        {
+            "event": None,
+            "convergenceRound": baseline_rounds[-1]["round"],
+            "rounds": _rounds_with_empty_holddowns(baseline_rounds, ordered_nodes),
+        }
+    ]
+
+    vectors = baseline_rounds[-1]["routers"]
+    for event in events:
+        state = apply_event(state, event)
+        active_adjacency = state.active_adjacency()
+        round_zero, holddowns_zero = distance_vector_holddown_round_zero(
+            vectors,
+            ordered_nodes,
+            active_adjacency,
+            state.down_nodes,
+            hold_down_rounds,
+        )
+        rounds, vectors = distance_vector_holddown_convergence(
+            round_zero,
+            holddowns_zero,
+            ordered_nodes,
+            active_adjacency,
+            state.down_nodes,
+            infinity_metric,
+            hold_down_rounds,
+        )
+        timeline.append(
+            {
+                "time": event.time,
+                "event": event.raw,
+                "convergenceRound": rounds[-1]["round"],
+                "rounds": rounds,
+            }
+        )
+    return {
+        "protocol": "distance-vector",
+        "infinityMetric": infinity_metric,
+        "holdDownRounds": hold_down_rounds,
         "timeline": timeline,
     }
 

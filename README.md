@@ -69,6 +69,36 @@ break to the smaller next-hop name. The recorded rounds make the rising
 metrics, alternating advertisements and final unreachability fully
 auditable.
 
+The scenario may additionally carry `holdDownRounds`: a non-boolean
+non-negative integer selecting optional route hold-down after the baseline.
+When it is omitted, input, output and behavior are unchanged; `0` also
+disables suppression explicitly (and likewise produces the legacy output).
+Any other type or a negative value reports `invalid scenario` with exit
+status 2 (topology errors still take precedence). When enabled, the root
+object echoes `holdDownRounds`, and every round of every timeline entry
+gains a `holdDowns` object: for each declared router it maps a destination
+to the positive number of full update rounds still left on that route's
+hold-down timer, and is `{}` when no timer is live.
+
+At round 0 after a failure event (and in later rounds), an online router's
+previously finite route whose selected next hop is no longer an available
+direct neighbor, or whose selected next hop now advertises the destination
+as unreachable, is immediately reported as `null`/`null` and starts a timer
+for `holdDownRounds` complete update rounds (the conclusion propagates
+transitively, so a route via such a hop is held as well). While a timer is
+live, finite advertisements from other neighbors cannot restore that
+destination; a destination that becomes a directly connected neighbor is
+adopted immediately at its direct metric and clears the timer. Repeated
+unreachable advertisements never extend a running timer; after the
+remainder reaches zero the destination rejoins normal selection in the next
+round. A router's own route and a down router's whole row keep their existing
+semantics, and down routers carry no timers. Rounds are recorded until both
+the forwarding tables and the `holdDowns` maps stop changing, and
+`convergenceRound` points at the last recorded round. Synchronous updates,
+the event format, `infinityMetric`, the infinity threshold and the
+smaller-next-hop tie rule are unchanged. `replay`, `replay-ls`, `compute`
+and `converge` ignore `holdDownRounds`.
+
 `replay-ls` reads the same topology and scenario format but replays the
 link-state protocol itself, exposing neighbor discovery, LSA flooding and
 SPF round by round. Output is

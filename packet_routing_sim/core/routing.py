@@ -255,3 +255,301 @@ def distance_vector_failure_convergence(
         vectors = updated
         rounds.append({"round": len(rounds), "routers": vectors})
     return rounds
+
+
+# ---------------------------------------------------------------------------
+# Route hold-down (optional replay-dv suppression)
+# ---------------------------------------------------------------------------
+#
+# A hold-down keeps a destination unreachable for a finite number of full
+# synchronous update rounds after the router's own finite route to it was
+# invalidated, so a possibly unstable alternative cannot be adopted at once.
+# The suppression state is a ``{router: {destination: remaining_rounds}}``
+# map carried *beside* the advertised vectors (never inside them): a held
+# route still advertises exactly ``null``/``null``, so the event format, the
+# infinity threshold, synchronous updates and tie breaks are all unchanged.
+#
+# An internal timer holds a *positive* remaining count while it is live:
+#
+# * Round 0 (immediately after an event) starts every invalidated route's
+#   timer at ``hold_down`` and publishes that count.  Invalidation is found
+#   as a monotone closure: a retained finite route whose selected next hop is
+#   gone, is down, or itself advertises the destination unreachable at round 0
+#   is itself invalidated -- and that conclusion propagates transitively.
+# * Each later synchronous round suppresses while the carried count is
+#   positive, then hands the next round one less.  A route invalidated later
+#   (its selected hop's advertisement turns unusable) starts a fresh window at
+#   that round.  More unreachability arriving inside a live window simply
+#   keeps counting down; it never extends the window.
+# * A destination that is a current direct neighbor is always adopted at its
+#   direct metric, at any round, and its timer is cleared immediately.
+# * Once the count reaches zero the *next* round rejoins ordinary selection.
+#
+# Down routers hold no timers; their whole row stays ``null``/``null``.
+
+
+def _empty_holddowns(ordered_nodes):
+    """A fresh ``{router: {destination: remaining}}`` map, one row per router."""
+    return {router: {} for router in ordered_nodes}
+
+
+def holddowns_public(holddowns, ordered_nodes):
+    """A fresh sorted copy of the suppression map for published output."""
+    return {
+        router: {
+            destination: holddowns[router][destination]
+            for destination in sorted(holddowns[router])
+        }
+        for router in ordered_nodes
+    }
+
+
+def _holddown_round_zero_vectors(
+    previous, ordered_nodes, active_adjacency, down_nodes
+):
+    """Round-zero forwarding vectors under hold-down.
+
+    These agree with :func:`distance_vector_failure_round_zero` and then
+    transitively null any retained finite route whose selected next hop now
+    advertises the destination as unreachable.  Direct neighbors, self routes
+    and down-router rows are exactly as in the legacy round zero.  The map is
+    monotone (finite routes only become null), so iteration reaches a unique
+    least fixed point independent of scan order.
+    """
+    current = distance_vector_failure_round_zero(
+        previous, ordered_nodes, active_adjacency, down_nodes
+    )
+    while True:
+        updated = {}
+        for router in ordered_nodes:
+            if router in down_nodes:
+                updated[router] = _unreachable_row(ordered_nodes)
+                continue
+            row = {}
+            for destination in ordered_nodes:
+                if destination == router:
+                    row[destination] = {"nextHop": None, "metric": 0}
+                elif destination in active_adjacency[router]:
+                    row[destination] = {
+                        "nextHop": destination,
+                        "metric": active_adjacency[router][destination],
+                    }
+                else:
+                    entry = current[router][destination]
+                    hop = entry["nextHop"]
+                    if hop is None or hop not in active_adjacency[router]:
+                        row[destination] = {"nextHop": None, "metric": None}
+                    elif current[hop][destination]["metric"] is None:
+                        # The still-present selected hop no longer offers a
+                        # way to the destination: null it, possibly enabling
+                        # further nulls on the next closure pass.
+                        row[destination] = {"nextHop": None, "metric": None}
+                    else:
+                        row[destination] = dict(entry)
+            updated[router] = row
+        if updated == current:
+            return current
+        current = updated
+
+
+def distance_vector_holddown_round_zero(
+    previous, ordered_nodes, active_adjacency, down_nodes, hold_down
+):
+    """Round 0 after an event with hold-down enabled.
+
+    Returns ``(vectors, holddowns)`` where every online router's previously
+    finite, non-direct route that round zero renders unreachable starts a
+    ``hold_down``-round timer; everything else carries no timer.
+    """
+    vectors = _holddown_round_zero_vectors(
+        previous, ordered_nodes, active_adjacency, down_nodes
+    )
+    holddowns = _empty_holddowns(ordered_nodes)
+    if hold_down <= 0:
+        return vectors, holddowns
+    for router in ordered_nodes:
+        if router in down_nodes:
+            continue
+        timed = holddowns[router]
+        for destination in ordered_nodes:
+            if destination == router or destination in active_adjacency[router]:
+                continue
+            prior = previous[router][destination]
+            if (
+                prior["nextHop"] is not None
+                and vectors[router][destination]["metric"] is None
+            ):
+                timed[destination] = hold_down
+    return vectors, holddowns
+
+
+def _selected_hop_usable(
+    router, destination, hop, previous, adjacency, infinity_metric
+):
+    """Whether the route currently selected via ``hop`` stays finite.
+
+    The same usability test an ordinary synchronous round applies to that
+    hop's own previous-round advertisement: a present neighbor advertising
+    unreachable, or a total metric at/above the infinity threshold, no longer
+    carries the route.
+    """
+    if hop not in adjacency[router]:
+        return False
+    advertised = previous[hop][destination]["metric"]
+    if advertised is None:
+        return False
+    return adjacency[router][hop] + advertised < infinity_metric
+
+
+def distance_vector_holddown_round(
+    previous,
+    ordered_nodes,
+    adjacency,
+    down_nodes,
+    infinity_metric,
+    holddowns,
+    hold_down,
+):
+    """One synchronous round with hold-down suppression.
+
+    Returns ``(vectors, holddowns)`` for the *next* round.  For an online
+    router and a destination that is not a current direct neighbor:
+
+    * a live timer (positive carried count) forces ``null``/``null`` and
+      refuses every learned finite advertisement this round; the next round
+      receives one less, and the timer disappears at zero -- repeated
+      unreachability never resets it;
+    * a selected finite route whose hop has just become unusable starts a
+      fresh window and is reported unreachable this round;
+    * otherwise the ordinary synchronous best-neighbor scan runs, with the
+      infinity threshold and smaller-next-hop tie rule unchanged.
+
+    A destination that is currently directly reachable is always adopted at
+    its direct metric and clears any timer at once.
+    """
+    current = {}
+    next_holddowns = _empty_holddowns(ordered_nodes)
+    for router in ordered_nodes:
+        if router in down_nodes:
+            current[router] = _unreachable_row(ordered_nodes)
+            continue
+        row = {}
+        for destination in ordered_nodes:
+            if destination == router:
+                row[destination] = {"nextHop": None, "metric": 0}
+                continue
+            if destination in adjacency[router]:
+                # Direct reachability overrides any live hold-down and clears
+                # its timer.
+                row[destination] = {
+                    "nextHop": destination,
+                    "metric": adjacency[router][destination],
+                }
+                continue
+
+            remaining = holddowns[router].get(destination)
+            selected_hop = previous[router][destination]["nextHop"]
+            invalidated = (
+                remaining is None
+                and selected_hop is not None
+                and not _selected_hop_usable(
+                    router,
+                    destination,
+                    selected_hop,
+                    previous,
+                    adjacency,
+                    infinity_metric,
+                )
+            )
+
+            if invalidated:
+                # The finite route in use failed this round; the window opens.
+                row[destination] = {"nextHop": None, "metric": None}
+                next_holddowns[router][destination] = hold_down
+                continue
+
+            if remaining is not None:
+                # Inside the suppression window: no learned finite route may
+                # restore the destination; count the consumed round down.
+                row[destination] = {"nextHop": None, "metric": None}
+                if remaining - 1 > 0:
+                    next_holddowns[router][destination] = remaining - 1
+                continue
+
+            # No window: ordinary synchronous best-route selection.
+            best_metric = None
+            best_hop = None
+            for neighbor in sorted(adjacency[router]):
+                advertised = previous[neighbor][destination]["metric"]
+                if advertised is None:
+                    continue
+                candidate = adjacency[router][neighbor] + advertised
+                if candidate >= infinity_metric:
+                    continue
+                # Neighbors are iterated in name order, so the first best
+                # candidate keeps the smaller next-hop name on ties.
+                if best_metric is None or candidate < best_metric:
+                    best_metric = candidate
+                    best_hop = neighbor
+            if best_metric is None:
+                row[destination] = {"nextHop": None, "metric": None}
+            else:
+                row[destination] = {
+                    "nextHop": best_hop, "metric": best_metric
+                }
+        current[router] = row
+    return current, next_holddowns
+
+
+def distance_vector_holddown_convergence(
+    round_zero,
+    holddowns_zero,
+    ordered_nodes,
+    active_adjacency,
+    down_nodes,
+    infinity_metric,
+    hold_down,
+):
+    """Record rounds under hold-down until vectors and timers are both stable.
+
+    Round 0 is recorded as given; each later round is one synchronous
+    hold-down update.  A round is recorded while either the forwarding
+    vectors or the published hold-down map still change, so
+    ``convergenceRound`` points at the last round that is not yet a fixed
+    point under both.  Returns ``(rounds, final_vectors)``.
+    """
+    rounds = [
+        {
+            "round": 0,
+            "routers": round_zero,
+            "holdDowns": holddowns_public(holddowns_zero, ordered_nodes),
+        }
+    ]
+    vectors = round_zero
+    holddowns = holddowns_zero
+    while True:
+        updated, next_holddowns = distance_vector_holddown_round(
+            vectors,
+            ordered_nodes,
+            active_adjacency,
+            down_nodes,
+            infinity_metric,
+            holddowns,
+            hold_down,
+        )
+        next_public = holddowns_public(next_holddowns, ordered_nodes)
+        if (
+            updated == vectors
+            and next_public == rounds[-1]["holdDowns"]
+        ):
+            break
+        vectors = updated
+        holddowns = next_holddowns
+        rounds.append(
+            {
+                "round": len(rounds),
+                "routers": vectors,
+                "holdDowns": next_public,
+            }
+        )
+    return rounds, vectors
