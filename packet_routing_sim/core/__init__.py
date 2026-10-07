@@ -8,7 +8,9 @@ Public entry points:
 * :func:`replay_ls_scenario`  -> ``{"protocol", "timeline"}`` with auditable
   neighbor discovery, LSA flooding and per-database SPF rounds
 * :func:`replay_dv_scenario`  -> ``{"protocol", "infinityMetric",
-  "timeline"}`` (distance-vector)
+  "timeline"}`` (distance-vector; also echoes ``holdDownRounds`` only when
+  that optional field is supplied, in which case every post-baseline round
+  carries a ``holdDowns`` view)
 
 Each entry point takes already-decoded JSON values (plain ``dict``/``list``/
 ``str``/``int``) and returns fresh plain-Python data.  The core performs no
@@ -47,9 +49,14 @@ from .routing import (
     distance_vector_convergence,
     distance_vector_failure_convergence,
     distance_vector_failure_round_zero,
+    distance_vector_hold_down_convergence,
+    distance_vector_hold_down_round,
+    distance_vector_hold_down_round_zero,
+    empty_hold_down_timers,
     forwarding_table,
     initial_distance_vectors,
     link_state_snapshot,
+    public_hold_downs,
 )
 from .scenario import validate_dv_scenario, validate_scenario
 from .state import NetworkState, apply_event
@@ -64,6 +71,11 @@ __all__ = [
     "replay_ls_validated",
     "replay_dv_scenario",
     "replay_dv_validated",
+    "distance_vector_hold_down_convergence",
+    "distance_vector_hold_down_round",
+    "distance_vector_hold_down_round_zero",
+    "empty_hold_down_timers",
+    "public_hold_downs",
     "snapshot_state",
     "validate_topology",
     "validate_scenario",
@@ -248,7 +260,7 @@ def replay_dv_validated(topo, scenario):
     baseline entry has ``event: null``; event entries echo ``time`` and the
     raw event verbatim.
     """
-    events, infinity_metric = validate_dv_scenario(
+    events, infinity_metric, hold_down_rounds = validate_dv_scenario(
         topo, copy.deepcopy(scenario)
     )
 
@@ -270,21 +282,62 @@ def replay_dv_validated(topo, scenario):
         }
     ]
 
+    # An absent field, or an explicit zero, disables hold-down entirely; the
+    # resulting output is then byte-identical to the unconfigured replay.
+    if not hold_down_rounds:
+        vectors = baseline_rounds[-1]["routers"]
+        for event in events:
+            state = apply_event(state, event)
+            active_adjacency = state.active_adjacency()
+            round_zero = distance_vector_failure_round_zero(
+                vectors, ordered_nodes, active_adjacency, state.down_nodes
+            )
+            rounds = distance_vector_failure_convergence(
+                round_zero,
+                ordered_nodes,
+                active_adjacency,
+                state.down_nodes,
+                infinity_metric,
+            )
+            vectors = rounds[-1]["routers"]
+            timeline.append(
+                {
+                    "time": event.time,
+                    "event": event.raw,
+                    "convergenceRound": rounds[-1]["round"],
+                    "rounds": rounds,
+                }
+            )
+        return {
+            "protocol": "distance-vector",
+            "infinityMetric": infinity_metric,
+            "timeline": timeline,
+        }
+
+    # Hold-down is configured: the baseline converges without suppression,
+    # then every post-baseline event keeps per-destination timers alongside
+    # the forwarding tables and exposes the public holdDowns view each round.
     vectors = baseline_rounds[-1]["routers"]
+    timers = empty_hold_down_timers(ordered_nodes)
     for event in events:
         state = apply_event(state, event)
         active_adjacency = state.active_adjacency()
-        round_zero = distance_vector_failure_round_zero(
-            vectors, ordered_nodes, active_adjacency, state.down_nodes
+        round_zero, timers = distance_vector_hold_down_round_zero(
+            vectors,
+            ordered_nodes,
+            active_adjacency,
+            state.down_nodes,
+            hold_down_rounds,
+            timers,
         )
-        rounds = distance_vector_failure_convergence(
+        rounds, vectors, timers = distance_vector_hold_down_convergence(
             round_zero,
+            timers,
             ordered_nodes,
             active_adjacency,
             state.down_nodes,
             infinity_metric,
         )
-        vectors = rounds[-1]["routers"]
         timeline.append(
             {
                 "time": event.time,
@@ -296,6 +349,7 @@ def replay_dv_validated(topo, scenario):
     return {
         "protocol": "distance-vector",
         "infinityMetric": infinity_metric,
+        "holdDownRounds": hold_down_rounds,
         "timeline": timeline,
     }
 

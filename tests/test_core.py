@@ -1250,14 +1250,29 @@ class TestDistanceVectorReplay(unittest.TestCase):
 
 class TestDistanceVectorReplayValidation(unittest.TestCase):
     def test_validate_dv_scenario_returns_events_and_infinity(self):
-        events, infinity_metric = validate_dv_scenario(
+        events, infinity_metric, hold_down_rounds = validate_dv_scenario(
             validate_topology(CHAIN3),
             {"infinityMetric": 8,
              "events": [{"time": 1, "action": "node-down", "node": "C"}]},
         )
         self.assertEqual(infinity_metric, 8)
+        self.assertIsNone(hold_down_rounds)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].node, "C")
+
+    def test_validate_dv_scenario_returns_hold_down_rounds_when_present(self):
+        topo = validate_topology(CHAIN3)
+        events, _infinity, hold_down_rounds = validate_dv_scenario(
+            topo, {"infinityMetric": 8, "holdDownRounds": 3, "events": []}
+        )
+        self.assertEqual(hold_down_rounds, 3)
+        self.assertEqual(events, ())
+        # An explicit zero is preserved (and disables suppression just like an
+        # absent field at the replay layer).
+        _events, _infinity, zero = validate_dv_scenario(
+            topo, {"infinityMetric": 8, "holdDownRounds": 0, "events": []}
+        )
+        self.assertEqual(zero, 0)
 
     def test_invalid_infinity_metric_values(self):
         invalid = [
@@ -1329,6 +1344,36 @@ class TestDistanceVectorReplayValidation(unittest.TestCase):
                 {"nodes": ["A", "A"], "links": []},
                 {"infinityMetric": 1},
             )
+        with self.assertRaises(InvalidTopology):
+            replay_dv_scenario(
+                {"nodes": ["A", "A"], "links": []},
+                {"infinityMetric": 1, "holdDownRounds": -1, "events": []},
+            )
+
+    def test_invalid_hold_down_rounds_values(self):
+        invalid = [
+            {"infinityMetric": 50, "holdDownRounds": True, "events": []},
+            {"infinityMetric": 50, "holdDownRounds": False, "events": []},
+            {"infinityMetric": 50, "holdDownRounds": -1, "events": []},
+            {"infinityMetric": 50, "holdDownRounds": -99, "events": []},
+            {"infinityMetric": 50, "holdDownRounds": 1.5, "events": []},
+            {"infinityMetric": 50, "holdDownRounds": 2.0, "events": []},
+            {"infinityMetric": 50, "holdDownRounds": "2", "events": []},
+            {"infinityMetric": 50, "holdDownRounds": None, "events": []},
+            {"infinityMetric": 50, "holdDownRounds": [], "events": []},
+            {"infinityMetric": 50, "holdDownRounds": {}, "events": []},
+        ]
+        for index, scenario in enumerate(invalid):
+            with self.subTest(case=index):
+                with self.assertRaises(InvalidScenario):
+                    replay_dv_scenario(CHAIN3, scenario)
+
+    def test_zero_hold_down_rounds_is_valid_and_silent(self):
+        result = replay_dv_scenario(
+            CHAIN3, {"infinityMetric": 50, "holdDownRounds": 0, "events": []}
+        )
+        self.assertEqual(set(result), {"protocol", "infinityMetric", "timeline"})
+        self.assertNotIn("holdDownRounds", result)
 
 
 class TestDistanceVectorReplayPurity(unittest.TestCase):
@@ -1403,6 +1448,388 @@ class TestDistanceVectorReplayPurity(unittest.TestCase):
             for snapshot in entry["rounds"]:
                 for row in snapshot["routers"].values():
                     self.assertEqual(list(row), ["A", "B", "C"])
+
+
+# ---------------------------------------------------------------------------
+# Distance-vector replay with optional route hold-down (replay-dv core)
+# ---------------------------------------------------------------------------
+
+
+# Primary path A-B-C (unit links); A-C (metric 10) is a surviving finite
+# alternative that hold-down must refuse to adopt until the timer expires.
+HD_TOPO = {
+    "nodes": ["A", "B", "C"],
+    "links": [link("A", "B", 1), link("B", "C", 1), link("A", "C", 10)],
+}
+
+
+def _hd_view(rounds):
+    """[(round, {(router, dest): (hop, metric)}, holdDowns)] for one entry."""
+    view = []
+    for snapshot in rounds:
+        tables = {
+            (router, dest): (entry["nextHop"], entry["metric"])
+            for router, row in snapshot["routers"].items()
+            for dest, entry in row.items()
+        }
+        view.append((snapshot["round"], tables, snapshot["holdDowns"]))
+    return view
+
+
+class TestDistanceVectorHoldDown(unittest.TestCase):
+    def test_omitted_field_is_byte_shape_compatible(self):
+        without = replay_dv_scenario(
+            HD_TOPO, {"infinityMetric": 100, "events": []}
+        )
+        self.assertEqual(
+            set(without), {"protocol", "infinityMetric", "timeline"}
+        )
+        for entry in without["timeline"]:
+            for snapshot in entry["rounds"]:
+                self.assertEqual(set(snapshot), {"round", "routers"})
+
+    def test_zero_field_is_indistinguishable_from_omitted(self):
+        events = [
+            {"time": 1, "action": "link-down", "from": "B", "to": "C"},
+            {"time": 2, "action": "link-up", "from": "C", "to": "B"},
+        ]
+        omitted = replay_dv_scenario(
+            HD_TOPO, {"infinityMetric": 100, "events": events}
+        )
+        zero = replay_dv_scenario(
+            HD_TOPO,
+            {"infinityMetric": 100, "holdDownRounds": 0, "events": events},
+        )
+        self.assertEqual(omitted, zero)
+        self.assertNotIn("holdDownRounds", zero)
+
+    def test_root_echoes_hold_down_rounds_only_when_configured(self):
+        result = replay_dv_scenario(
+            HD_TOPO,
+            {"infinityMetric": 100, "holdDownRounds": 2, "events": []},
+        )
+        self.assertEqual(result["holdDownRounds"], 2)
+        self.assertEqual(
+            set(result),
+            {"protocol", "infinityMetric", "holdDownRounds", "timeline"},
+        )
+
+    def test_baseline_has_no_hold_downs_and_converges_normally(self):
+        result = replay_dv_scenario(
+            HD_TOPO,
+            {"infinityMetric": 100, "holdDownRounds": 2, "events": []},
+        )
+        baseline = result["timeline"][0]
+        self.assertEqual(baseline["convergenceRound"], 1)
+        for snapshot in baseline["rounds"]:
+            self.assertEqual(set(snapshot), {"round", "routers"})
+        self.assertEqual(
+            baseline["rounds"][-1]["routers"],
+            compute_topology(HD_TOPO)["routers"],
+        )
+
+    def test_round_zero_starts_timer_on_lost_route_and_next_hop_withdrawal(self):
+        scenario = {
+            "infinityMetric": 100,
+            "holdDownRounds": 2,
+            "events": [{"time": 1, "action": "node-down", "node": "C"}],
+        }
+        rounds = replay_dv_scenario(DV_CHAIN, scenario)["timeline"][1]["rounds"]
+        round_zero = rounds[0]
+        null = {"nextHop": None, "metric": None}
+        # B loses its direct next hop C; A loses its selected next hop B's
+        # finite advertisement (B now advertises C unreachable).  Both start
+        # timers at round 0 even though A's own next hop B is still a neighbor.
+        self.assertEqual(round_zero["routers"]["B"]["C"], null)
+        self.assertEqual(round_zero["routers"]["A"]["C"], null)
+        self.assertEqual(round_zero["holdDowns"]["B"], {"C": 2})
+        self.assertEqual(round_zero["holdDowns"]["A"], {"C": 2})
+        # The down router's whole row stays unreachable and it holds nothing.
+        for dest in ("A", "B", "C"):
+            self.assertEqual(round_zero["routers"]["C"][dest], null)
+        self.assertEqual(round_zero["holdDowns"]["C"], {})
+
+    def test_finite_alternative_blocked_until_round_after_expiry(self):
+        scenario = {
+            "infinityMetric": 100,
+            "holdDownRounds": 2,
+            "events": [{"time": 1, "action": "link-down", "from": "B", "to": "C"}],
+        }
+        entry = replay_dv_scenario(HD_TOPO, scenario)["timeline"][1]
+        rounds = entry["rounds"]
+        null = {"nextHop": None, "metric": None}
+        # Rounds 0 and 1: B refuses the finite A-C alternative while held.
+        self.assertEqual(rounds[0]["routers"]["B"]["C"], null)
+        self.assertEqual(rounds[1]["routers"]["B"]["C"], null)
+        self.assertEqual(rounds[1]["holdDowns"]["B"], {"C": 1})
+        # Round 2: the remaining count is zero; still suppressed this round.
+        self.assertEqual(rounds[2]["routers"]["B"]["C"], null)
+        self.assertEqual(rounds[2]["holdDowns"]["B"], {})
+        # Round 3 (the round after expiry): normal selection adopts via A.
+        self.assertEqual(
+            rounds[3]["routers"]["B"]["C"], {"nextHop": "A", "metric": 11}
+        )
+        self.assertEqual(rounds[3]["holdDowns"]["B"], {})
+        self.assertEqual(entry["convergenceRound"], 3)
+        # A itself never used the failed next hop for C (it routes direct),
+        # so A holds nothing and keeps the direct route throughout.
+        for snapshot in rounds:
+            self.assertEqual(
+                snapshot["routers"]["A"]["C"], {"nextHop": "C", "metric": 10}
+            )
+            self.assertEqual(snapshot["holdDowns"]["A"], {})
+
+    def test_timer_counts_down_through_all_declared_routers(self):
+        scenario = {
+            "infinityMetric": 100,
+            "holdDownRounds": 3,
+            "events": [{"time": 1, "action": "link-down", "from": "B", "to": "C"}],
+        }
+        entry = replay_dv_scenario(HD_TOPO, scenario)["timeline"][1]
+        self.assertEqual(
+            [snapshot["holdDowns"]["B"].get("C") for snapshot in entry["rounds"]],
+            [3, 2, 1, None, None],
+        )
+        # Every declared router always appears in holdDowns; empty when idle.
+        for snapshot in entry["rounds"]:
+            self.assertEqual(set(snapshot["holdDowns"]), {"A", "B", "C"})
+        self.assertEqual(entry["convergenceRound"], 4)
+
+    def test_repeated_unreachable_advertisement_does_not_extend_timer(self):
+        # Hold for 2 rounds; B keeps advertising C unreachable the whole time
+        # (it has no usable alternative because A also refuses while held).
+        scenario = {
+            "infinityMetric": 8,
+            "holdDownRounds": 2,
+            "events": [{"time": 1, "action": "node-down", "node": "C"}],
+        }
+        entry = replay_dv_scenario(DV_CHAIN, scenario)["timeline"][1]
+        # Timers must count down exactly 2,1 regardless of repeated null ads;
+        # after expiry with no finite alternative, C simply stays unreachable.
+        self.assertEqual(
+            [snapshot["holdDowns"]["A"].get("C") for snapshot in entry["rounds"]],
+            [2, 1, None],
+        )
+        self.assertEqual(entry["convergenceRound"], 2)
+        final = entry["rounds"][-1]["routers"]
+        self.assertEqual(final["A"]["C"], {"nextHop": None, "metric": None})
+        self.assertEqual(final["B"]["C"], {"nextHop": None, "metric": None})
+
+    def test_direct_neighbor_recovery_adopts_at_once_and_clears_timer(self):
+        scenario = {
+            "infinityMetric": 100,
+            "holdDownRounds": 4,
+            "events": [
+                {"time": 1, "action": "link-down", "from": "B", "to": "C"},
+                {"time": 2, "action": "link-up", "from": "B", "to": "C"},
+            ],
+        }
+        timeline = replay_dv_scenario(HD_TOPO, scenario)["timeline"]
+        recovery_zero = timeline[2]["rounds"][0]
+        # The direct route is trusted immediately and the timer is gone.
+        self.assertEqual(
+            recovery_zero["routers"]["B"]["C"], {"nextHop": "C", "metric": 1}
+        )
+        self.assertEqual(recovery_zero["holdDowns"]["B"], {})
+        self.assertEqual(recovery_zero["holdDowns"]["C"], {})
+        final = timeline[2]["rounds"][-1]["routers"]
+        self.assertEqual(final, compute_topology(HD_TOPO)["routers"])
+
+    def test_node_recovery_clears_and_converges(self):
+        scenario = {
+            "infinityMetric": 100,
+            "holdDownRounds": 4,
+            "events": [
+                {"time": 1, "action": "node-down", "node": "C"},
+                {"time": 2, "action": "node-up", "node": "C"},
+            ],
+        }
+        timeline = replay_dv_scenario(CHAIN3, scenario)["timeline"]
+        recovery = timeline[2]
+        round_zero = recovery["rounds"][0]
+        # B's direct neighbor C is back: adopt at once, no hold-down.
+        self.assertEqual(
+            round_zero["routers"]["B"]["C"], {"nextHop": "C", "metric": 7}
+        )
+        self.assertEqual(round_zero["holdDowns"]["B"], {})
+        final = recovery["rounds"][-1]["routers"]
+        self.assertEqual(final, compute_topology(CHAIN3)["routers"])
+
+    def test_rounds_recorded_until_tables_and_timers_both_stable(self):
+        scenario = {
+            "infinityMetric": 100,
+            "holdDownRounds": 2,
+            "events": [{"time": 1, "action": "link-down", "from": "B", "to": "C"}],
+        }
+        entry = replay_dv_scenario(HD_TOPO, scenario)["timeline"][1]
+        numbers = [snapshot["round"] for snapshot in entry["rounds"]]
+        self.assertEqual(numbers, list(range(len(numbers))))
+        self.assertEqual(entry["convergenceRound"], numbers[-1])
+        # Timer-only rounds (tables unchanged, holdDowns changed) are kept.
+        self.assertEqual(
+            entry["rounds"][0]["routers"], entry["rounds"][1]["routers"]
+        )
+        self.assertNotEqual(
+            entry["rounds"][0]["holdDowns"], entry["rounds"][1]["holdDowns"]
+        )
+
+    def test_self_and_down_rows_unaffected_under_hold_down(self):
+        scenario = {
+            "infinityMetric": 8,
+            "holdDownRounds": 3,
+            "events": [{"time": 1, "action": "node-down", "node": "C"}],
+        }
+        rounds = replay_dv_scenario(DV_CHAIN, scenario)["timeline"][1]["rounds"]
+        null = {"nextHop": None, "metric": None}
+        for snapshot in rounds:
+            # Online routers keep their metric-0 self route.
+            for router in ("A", "B"):
+                self.assertEqual(
+                    snapshot["routers"][router][router],
+                    {"nextHop": None, "metric": 0},
+                )
+            # The down router's whole row, including its self entry, is
+            # unreachable and it holds no timers.
+            for dest in ("A", "B", "C"):
+                self.assertEqual(snapshot["routers"]["C"][dest], null)
+            self.assertEqual(snapshot["holdDowns"]["C"], {})
+
+
+class TestDistanceVectorHoldDownPurity(unittest.TestCase):
+    SCENARIO = {
+        "infinityMetric": 100,
+        "holdDownRounds": 2,
+        "events": [
+            {"time": 1, "action": "link-down", "from": "A", "to": "B"},
+            {"time": 2, "action": "node-down", "node": "B"},
+            {"time": 3, "action": "node-up", "node": "B"},
+            {"time": 4, "action": "link-up", "from": "B", "to": "A"},
+        ],
+    }
+
+    def test_inputs_remain_equal(self):
+        topology_before = copy.deepcopy(HD_TOPO)
+        scenario_before = copy.deepcopy(self.SCENARIO)
+        replay_dv_scenario(HD_TOPO, self.SCENARIO)
+        self.assertEqual(HD_TOPO, topology_before)
+        self.assertEqual(self.SCENARIO, scenario_before)
+
+    def test_no_carry_over_between_calls(self):
+        fault = {
+            "infinityMetric": 100,
+            "holdDownRounds": 3,
+            "events": [{"time": 1, "action": "node-down", "node": "C"}],
+        }
+        first = replay_dv_scenario(DV_CHAIN, fault)
+        second = replay_dv_scenario(DV_CHAIN, copy.deepcopy(fault))
+        self.assertEqual(first, second)
+        # A configured call leaves no state behind for an unconfigured one.
+        plain = replay_dv_scenario(
+            DV_CHAIN, {"infinityMetric": 100, "events": []}
+        )
+        self.assertNotIn("holdDownRounds", plain)
+
+    def test_mutating_result_cannot_pollute_later_calls(self):
+        first = replay_dv_scenario(HD_TOPO, copy.deepcopy(self.SCENARIO))
+        # Event 1 is link-down A-B: A legitimately starts a hold-down on B.
+        first["timeline"][1]["rounds"][0]["routers"]["A"]["B"] = {
+            "nextHop": "HACK", "metric": -1,
+        }
+        first["timeline"][1]["rounds"][0]["holdDowns"]["A"] = {}
+        second = replay_dv_scenario(HD_TOPO, copy.deepcopy(self.SCENARIO))
+        round_zero = second["timeline"][1]["rounds"][0]
+        self.assertEqual(
+            round_zero["routers"]["A"]["B"],
+            {"nextHop": None, "metric": None},
+        )
+        # Mutating the first result's holdDowns cannot change the second.
+        self.assertEqual(round_zero["holdDowns"]["A"], {"B": 2})
+
+    def test_result_is_json_serialisable_with_sorted_keys(self):
+        result = replay_dv_scenario(HD_TOPO, copy.deepcopy(self.SCENARIO))
+        json.loads(json.dumps(result))
+        for entry in result["timeline"]:
+            for snapshot in entry["rounds"]:
+                self.assertEqual(list(snapshot["routers"]), ["A", "B", "C"])
+                if "holdDowns" in snapshot:
+                    self.assertEqual(list(snapshot["holdDowns"]), ["A", "B", "C"])
+
+
+_DV_HD_DETERMINISM_SNIPPET = """
+import json, os, sys
+sys.path.insert(0, %r)
+from packet_routing_sim.core import replay_dv_scenario
+sys.stdout.write(json.dumps(
+    replay_dv_scenario(json.loads(os.environ["PRSIM_TOPO"]),
+                       json.loads(os.environ["PRSIM_SCEN"])),
+    sort_keys=True))
+""" % str(REPO_ROOT)
+
+
+def run_dv_hd_core_in_subprocess(topology, scenario, seed):
+    env = dict(os.environ)
+    env["PYTHONHASHSEED"] = str(seed)
+    env["PRSIM_TOPO"] = json.dumps(topology)
+    env["PRSIM_SCEN"] = json.dumps(scenario)
+    proc = subprocess.run(
+        [sys.executable, "-c", _DV_HD_DETERMINISM_SNIPPET],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+class TestDistanceVectorHoldDownDeterminism(unittest.TestCase):
+    TOPOLOGY = {
+        "nodes": ["A", "B", "C", "D"],
+        "links": [
+            link("A", "B", 1),
+            link("B", "C", 2),
+            link("C", "D", 3),
+            link("D", "A", 4),
+        ],
+    }
+    SCENARIO = {
+        "infinityMetric": 30,
+        "holdDownRounds": 3,
+        "events": [
+            {"time": 3, "action": "link-down", "from": "A", "to": "B"},
+            {"time": 5, "action": "node-down", "node": "C"},
+            {"time": 8, "action": "link-down", "from": "D", "to": "C"},
+            {"time": 9, "action": "node-up", "node": "C"},
+            {"time": 12, "action": "link-up", "from": "C", "to": "D"},
+            {"time": 15, "action": "link-up", "from": "B", "to": "A"},
+        ],
+    }
+    VARIANTS = [
+        TOPOLOGY,
+        {"nodes": ["D", "C", "B", "A"], "links": TOPOLOGY["links"]},
+        {
+            "nodes": ["A", "B", "C", "D"],
+            "links": [
+                link("B", "A", 1),
+                link("C", "B", 2),
+                link("D", "C", 3),
+                link("A", "D", 4),
+            ],
+        },
+        {
+            "nodes": ["A", "B", "C", "D"],
+            "links": list(reversed(TOPOLOGY["links"])),
+        },
+    ]
+
+    def test_byte_identical_across_seeds_and_declaration_order(self):
+        outputs = set()
+        for seed in HASH_SEEDS:
+            for variant in self.VARIANTS:
+                outputs.add(
+                    run_dv_hd_core_in_subprocess(variant, self.SCENARIO, seed)
+                )
+        self.assertEqual(len(outputs), 1)
 
 
 _DV_DETERMINISM_SNIPPET = """

@@ -1137,6 +1137,177 @@ def dv_expected_timeline(topology, scenario):
     return timeline
 
 
+# ---------------------------------------------------------------------------
+# replay-dv with hold-down: independent oracle
+# ---------------------------------------------------------------------------
+
+
+def dv_hd_round_zero_after(previous, prev_timers, nodes, active,
+                           down_nodes, hold_down_rounds):
+    """Independent post-event round 0 with hold-down.
+
+    Returns ``(tables, timers)`` where tables is the normalized
+    ``{(r, d): (hop, metric)}`` mapping and timers only keeps positive
+    remaining counts keyed by ``(r, d)``.
+    """
+    plain = dv_round_zero_after(previous, nodes, active, down_nodes)
+    tables = {}
+    timers = {}
+    for router in nodes:
+        if router in down_nodes:
+            for dest in nodes:
+                tables[router, dest] = (None, None)
+            continue
+        for dest in nodes:
+            if dest == router:
+                tables[router, dest] = (None, 0)
+                continue
+            if dest in active[router]:
+                # A direct neighbor is trusted at once and clears the timer.
+                tables[router, dest] = (dest, active[router][dest])
+                continue
+            remaining = prev_timers.get((router, dest), 0)
+            prior_hop = previous[router, dest][0]
+            lost = (
+                prior_hop is not None
+                and (
+                    prior_hop not in active[router]
+                    or plain[prior_hop, dest][1] is None
+                )
+            )
+            if remaining > 0:
+                tables[router, dest] = (None, None)
+                timers[router, dest] = remaining
+            elif lost:
+                tables[router, dest] = (None, None)
+                if hold_down_rounds > 0:
+                    timers[router, dest] = hold_down_rounds
+            else:
+                tables[router, dest] = plain[router, dest]
+    return tables, timers
+
+
+def dv_hd_synchronous(previous, timers, nodes, active,
+                      down_nodes, infinity_metric):
+    """One synchronous Bellman-Ford round honoring active hold-down timers."""
+    current = {}
+    next_timers = {}
+    for router in nodes:
+        if router in down_nodes:
+            for dest in nodes:
+                current[router, dest] = (None, None)
+            continue
+        for dest in nodes:
+            if dest == router:
+                current[router, dest] = (None, 0)
+                continue
+            remaining = timers.get((router, dest), 0)
+            if remaining > 0:
+                current[router, dest] = (None, None)
+                if remaining - 1 > 0:
+                    next_timers[router, dest] = remaining - 1
+                continue
+            best_cost, best_hop = None, None
+            for neighbor in sorted(active[router]):
+                advertised_cost = previous[neighbor, dest][1]
+                if advertised_cost is None:
+                    continue
+                cost = active[router][neighbor] + advertised_cost
+                if cost >= infinity_metric:
+                    continue
+                if best_cost is None or cost < best_cost:
+                    best_cost, best_hop = cost, neighbor
+            current[router, dest] = (
+                (None, None) if best_cost is None else (best_hop, best_cost)
+            )
+    return current, next_timers
+
+
+def dv_hd_expected_timeline(topology, scenario):
+    """Full normalized expected timeline, independently of the SUT.
+
+    Each timeline item is ``(time, rounds)``; the baseline has time ``None``
+    and plain rounds (no holdDowns), every later item's rounds are
+    ``(number, tables, holdDowns)`` triples.
+    """
+    nodes, adjacency = build_adjacency(topology)
+    infinity_metric = scenario["infinityMetric"]
+    hold_down_rounds = scenario["holdDownRounds"]
+    down_nodes, down_links = set(), set()
+
+    def active_map():
+        disabled = {frozenset(p) for p in down_links}
+        active = {node: {} for node in nodes}
+        for source in nodes:
+            if source in down_nodes:
+                continue
+            for target, metric in adjacency[source].items():
+                if target in down_nodes:
+                    continue
+                if frozenset((source, target)) in disabled:
+                    continue
+                active[source][target] = metric
+        return active
+
+    def converge_plain(initial):
+        rounds = [initial]
+        current = initial
+        while True:
+            updated = dv_synchronous(
+                current, nodes, active_map(), down_nodes, infinity_metric
+            )
+            if updated == current:
+                return rounds, current
+            current = updated
+            rounds.append(current)
+
+    def converge_hd(initial, initial_timers):
+        rounds = [(0, initial, _public_timers(initial_timers, nodes))]
+        current, timers = initial, initial_timers
+        number = 1
+        while True:
+            updated, next_timers = dv_hd_synchronous(
+                current, timers, nodes, active_map(),
+                down_nodes, infinity_metric,
+            )
+            if updated == current and next_timers == timers:
+                return rounds, current, timers
+            current, timers = updated, next_timers
+            rounds.append((number, current, _public_timers(timers, nodes)))
+            number += 1
+
+    vectors = round_zero(nodes, active_map())
+    baseline_rounds, vectors = converge_plain(vectors)
+    timeline = [(None, [(r, tables) for r, tables in
+                        enumerate(baseline_rounds)])]
+
+    timers = {}
+    for event in scenario["events"]:
+        if event["action"] == "node-down":
+            down_nodes.add(event["node"])
+        elif event["action"] == "node-up":
+            down_nodes.discard(event["node"])
+        elif event["action"] == "link-down":
+            down_links.add(frozenset((event["from"], event["to"])))
+        else:
+            down_links.discard(frozenset((event["from"], event["to"])))
+        vectors, timers = dv_hd_round_zero_after(
+            vectors, timers, nodes, active_map(), down_nodes, hold_down_rounds
+        )
+        rounds, vectors, timers = converge_hd(vectors, timers)
+        timeline.append((event["time"], rounds))
+    return timeline
+
+
+def _public_timers(timers, nodes):
+    """{router: {dest: positive remaining}} from the flat timer mapping."""
+    view = {router: {} for router in nodes}
+    for (router, dest), remaining in timers.items():
+        if remaining > 0:
+            view[router][dest] = remaining
+    return view
+
+
 class TestReplayDV(unittest.TestCase):
     def _apply_state(self, event, down_nodes, down_links):
         action = event["action"]
@@ -1410,6 +1581,198 @@ class TestReplayDVInvalidScenarios(unittest.TestCase):
                 self.assertEqual(proc.returncode, 2)
                 self.assertEqual(proc.stdout, b"")
                 self.assertEqual(proc.stderr, REPLAY_DV_USAGE.encode())
+
+
+# ---------------------------------------------------------------------------
+# replay-dv with hold-down: envelope, independent-oracle trace, errors
+# ---------------------------------------------------------------------------
+
+
+HD_TOPO = {
+    "nodes": ["A", "B", "C"],
+    "links": [link("A", "B", 1), link("B", "C", 1), link("A", "C", 10)],
+}
+
+
+def normalize_hd_result(result):
+    """Convert a replay-dv-with-hold-down JSON result into oracle structures.
+
+    Baseline rounds become ``(number, tables)`` pairs; event rounds become
+    ``(number, tables, holdDowns)`` triples.
+    """
+    timeline = []
+    for entry in result["timeline"]:
+        rounds = []
+        for snapshot in entry["rounds"]:
+            tables = normalize(snapshot["routers"])
+            if "holdDowns" in snapshot:
+                rounds.append((snapshot["round"], tables, snapshot["holdDowns"]))
+            else:
+                rounds.append((snapshot["round"], tables))
+        timeline.append((entry.get("time"), rounds))
+    return timeline
+
+
+class TestReplayDVHoldDown(unittest.TestCase):
+    def test_omitted_or_zero_is_byte_indistinguishable_from_plain(self):
+        events = [
+            {"time": 1, "action": "link-down", "from": "B", "to": "C"},
+            {"time": 2, "action": "link-up", "from": "C", "to": "B"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = invoke_replay_dv(
+                tmp, HD_TOPO, {"infinityMetric": 100, "events": events}
+            )
+            zero = invoke_replay_dv(
+                tmp, HD_TOPO,
+                {"infinityMetric": 100, "holdDownRounds": 0, "events": events},
+            )
+            self.assertEqual(plain.returncode, 0, plain.stderr)
+            self.assertEqual(zero.returncode, 0, zero.stderr)
+            self.assertEqual(plain.stdout, zero.stdout)
+            result = json.loads(plain.stdout)
+            self.assertEqual(
+                set(result), {"protocol", "infinityMetric", "timeline"}
+            )
+            for entry in result["timeline"]:
+                for snapshot in entry["rounds"]:
+                    self.assertEqual(set(snapshot), {"round", "routers"})
+
+    def test_envelope_echoes_hold_down_rounds_and_adds_hold_downs(self):
+        scenario = {
+            "infinityMetric": 100,
+            "holdDownRounds": 2,
+            "events": [{"time": 1, "action": "node-down", "node": "C"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_dv(tmp, DV_CHAIN, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            self.assertEqual(
+                set(result),
+                {"protocol", "infinityMetric", "holdDownRounds", "timeline"},
+            )
+            self.assertEqual(result["holdDownRounds"], 2)
+            # Baseline is unaffected: no holdDowns anywhere.
+            for snapshot in result["timeline"][0]["rounds"]:
+                self.assertEqual(set(snapshot), {"round", "routers"})
+            # Every event round carries holdDowns keyed by every declared node.
+            for snapshot in result["timeline"][1]["rounds"]:
+                self.assertEqual(
+                    set(snapshot), {"round", "routers", "holdDowns"}
+                )
+                self.assertEqual(
+                    set(snapshot["holdDowns"]), {"A", "B", "C"}
+                )
+
+    def test_hand_traced_blocked_alternative_and_timer(self):
+        scenario = {
+            "infinityMetric": 100,
+            "holdDownRounds": 2,
+            "events": [{"time": 1, "action": "link-down", "from": "B", "to": "C"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_dv(tmp, HD_TOPO, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            entry = json.loads(proc.stdout)["timeline"][1]
+            null = {"nextHop": None, "metric": None}
+            rows = [
+                (
+                    s["routers"]["B"]["C"],
+                    s["routers"]["A"]["C"],
+                    s["holdDowns"]["B"].get("C"),
+                )
+                for s in entry["rounds"]
+            ]
+            self.assertEqual(
+                rows,
+                [
+                    (null, {"nextHop": "C", "metric": 10}, 2),
+                    (null, {"nextHop": "C", "metric": 10}, 1),
+                    (null, {"nextHop": "C", "metric": 10}, None),
+                    ({"nextHop": "A", "metric": 11},
+                     {"nextHop": "C", "metric": 10}, None),
+                ],
+            )
+            self.assertEqual(entry["convergenceRound"], 3)
+
+    def test_timeline_matches_independent_oracle(self):
+        scenario = {
+            "infinityMetric": 30,
+            "holdDownRounds": 3,
+            "events": list(REPLAY_SCENARIO),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = invoke_replay_dv(tmp, DIAMOND, scenario)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = json.loads(proc.stdout)
+            actual = normalize_hd_result(result)
+            expected = dv_hd_expected_timeline(DIAMOND, scenario)
+            self.assertEqual(len(actual), len(expected))
+            for index, ((at, arounds), (et, erounds)) in enumerate(
+                zip(actual, expected)
+            ):
+                self.assertEqual(at, et, index)
+                self.assertEqual(
+                    [n for n, *_ in arounds], list(range(len(arounds))), index
+                )
+                self.assertEqual(
+                    result["timeline"][index]["convergenceRound"],
+                    arounds[-1][0],
+                    index,
+                )
+                for apair, epair in zip(arounds, erounds):
+                    self.assertEqual(apair, epair, (index, epair[0]))
+
+    def test_byte_identity_across_seeds_and_declaration_order(self):
+        scenario = {
+            "infinityMetric": 30,
+            "holdDownRounds": 3,
+            "events": list(REPLAY_SCENARIO),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            outputs = set()
+            for seed in HASH_SEEDS:
+                for variant_index, variant in enumerate(EQUIVALENT_VARIANTS):
+                    topo_path = write_topology(tmp, variant, f"v{variant_index}.json")
+                    scen_path = write_scenario(tmp, scenario, f"s{variant_index}.json")
+                    proc = run_cli(
+                        ["replay-dv", str(topo_path), str(scen_path)], seed=seed
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    outputs.add(proc.stdout)
+            self.assertEqual(len(outputs), 1)
+
+    def test_invalid_hold_down_rounds(self):
+        invalid = [
+            {"infinityMetric": 50, "holdDownRounds": True, "events": []},
+            {"infinityMetric": 50, "holdDownRounds": False, "events": []},
+            {"infinityMetric": 50, "holdDownRounds": -1, "events": []},
+            {"infinityMetric": 50, "holdDownRounds": 2.5, "events": []},
+            {"infinityMetric": 50, "holdDownRounds": "2", "events": []},
+            {"infinityMetric": 50, "holdDownRounds": None, "events": []},
+            {"infinityMetric": 50, "holdDownRounds": [], "events": []},
+            {"infinityMetric": 50, "holdDownRounds": {}, "events": []},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, scenario in enumerate(invalid):
+                with self.subTest(case=index):
+                    proc = invoke_replay_dv(tmp, CHAIN3, scenario)
+                    self.assertEqual(proc.returncode, 2)
+                    self.assertEqual(proc.stdout, b"")
+                    self.assertEqual(proc.stderr, b"invalid scenario\n")
+
+    def test_topology_error_precedence_over_hold_down_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_topo = write_topology(tmp, {"nodes": ["A", "A"], "links": []})
+            scen = write_scenario(
+                tmp,
+                {"infinityMetric": 1, "holdDownRounds": -1, "events": []},
+            )
+            proc = run_cli(["replay-dv", str(bad_topo), str(scen)])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(proc.stderr, b"invalid topology\n")
 
 
 # ---------------------------------------------------------------------------

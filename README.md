@@ -69,6 +69,36 @@ break to the smaller next-hop name. The recorded rounds make the rising
 metrics, alternating advertisements and final unreachability fully
 auditable.
 
+`replay-dv` additionally accepts an optional `holdDownRounds` field: a
+non-boolean non-negative integer configuring route hold-down (route
+holddown/route poisoning suppression) for every failure event after the
+baseline. When it is omitted the input, output and behavior are
+byte-for-byte identical to a scenario without the field; an explicit `0`
+likewise disables suppression. Any other type or a negative value makes
+the command report `invalid scenario`, exit with status 2 and write
+nothing to standard output (topology errors still take precedence). When
+configured, the result root echoes `holdDownRounds`.
+
+Hold-down models a router that, after a finite route fails, refuses to
+relearn that destination from a possibly unstable alternative for a fixed
+number of complete update rounds. In round 0 after an event, an online
+router whose finite route to a destination is lost—either because its
+selected next hop is no longer an available direct neighbor, or because
+that next hop now advertises the destination unreachable—immediately
+outputs `null`/`null` and starts a timer, unless the destination is itself
+currently a direct neighbor (in which case the direct metric is adopted at
+once and any timer cleared). While a timer is active, finite
+advertisements from other neighbors cannot reinstall the destination; the
+router's own route and a down router's whole row keep their usual
+semantics. A repeated unreachable advertisement does not extend the timer,
+and the round after the remaining count reaches zero the destination
+rejoins normal route selection. With hold-down enabled, every recorded
+round adds a `holdDowns` object mapping each declared router to a
+destination-to-positive-remaining-rounds map (an empty object when the
+router has no active timer); rounds are recorded until both the forwarding
+tables and the hold-down maps stop changing, and `convergenceRound` points
+at the last recorded round.
+
 `replay-ls` reads the same topology and scenario format but replays the
 link-state protocol itself, exposing neighbor discovery, LSA flooding and
 SPF round by round. Output is
