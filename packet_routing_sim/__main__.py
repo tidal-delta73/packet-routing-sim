@@ -110,8 +110,13 @@ def run_converge(path):
     return 0
 
 
-def run_replay(topology_path, scenario_path):
-    # Topology problems take precedence over scenario problems.
+def _run_replay(topology_path, scenario_path, replay_validated):
+    """Shared file/error/serialization boundary for every replay command.
+
+    Topology problems are always reported before the scenario is even read
+    or validated.  Structural scenario failures and illegal state
+    transitions share the one ``invalid scenario`` report.
+    """
     topology = _read_json(
         topology_path,
         "cannot read topology: {path}",
@@ -135,73 +140,22 @@ def run_replay(topology_path, scenario_path):
     try:
         result = replay_validated(topo, scenario)
     except InvalidScenario:
-        # Covers structural/value failures and illegal state transitions.
         print("invalid scenario", file=sys.stderr)
         return 2
     _emit(result)
     return 0
+
+
+def run_replay(topology_path, scenario_path):
+    return _run_replay(topology_path, scenario_path, replay_validated)
 
 
 def run_replay_dv(topology_path, scenario_path):
-    """Distance-vector replay: identical file/error conventions as replay."""
-    topology = _read_json(
-        topology_path,
-        "cannot read topology: {path}",
-        "invalid topology",
-    )
-    if topology is _READ_FAILED:
-        return 2
-    try:
-        topo = validate_topology(topology)
-    except InvalidTopology:
-        print("invalid topology", file=sys.stderr)
-        return 2
-
-    scenario = _read_json(
-        scenario_path,
-        "cannot read scenario: {path}",
-        "invalid scenario",
-    )
-    if scenario is _READ_FAILED:
-        return 2
-    try:
-        result = replay_dv_validated(topo, scenario)
-    except InvalidScenario:
-        print("invalid scenario", file=sys.stderr)
-        return 2
-    _emit(result)
-    return 0
+    return _run_replay(topology_path, scenario_path, replay_dv_validated)
 
 
 def run_replay_ls(topology_path, scenario_path):
-    """Link-state flooding replay: identical file/error conventions as replay."""
-    topology = _read_json(
-        topology_path,
-        "cannot read topology: {path}",
-        "invalid topology",
-    )
-    if topology is _READ_FAILED:
-        return 2
-    try:
-        topo = validate_topology(topology)
-    except InvalidTopology:
-        print("invalid topology", file=sys.stderr)
-        return 2
-
-    scenario = _read_json(
-        scenario_path,
-        "cannot read scenario: {path}",
-        "invalid scenario",
-    )
-    if scenario is _READ_FAILED:
-        return 2
-    try:
-        result = replay_ls_validated(topo, scenario)
-    except InvalidScenario:
-        print("invalid scenario", file=sys.stderr)
-        return 2
-    _emit(result)
-    return 0
+    return _run_replay(topology_path, scenario_path, replay_ls_validated)
 
 
 def main(argv: list[str] | None = None) -> int:
