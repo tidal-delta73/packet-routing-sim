@@ -43,6 +43,14 @@ commands:
                                 from a static undirected topology
   converge TOPOLOGY.json        show distance-vector convergence round
                                 by round from a static undirected topology
+  replay TOPOLOGY.json SCENARIO.json
+                                replay the static link-state
+                                failure timeline
+  replay-dv TOPOLOGY.json SCENARIO.json
+                                show distance-vector failure
+                                convergence round by round
+  replay-ls TOPOLOGY.json SCENARIO.json
+                                show link-state flooding round by round
   help                          print this message
 """
 
@@ -1952,19 +1960,101 @@ class TestCLIContract(unittest.TestCase):
         self.assertEqual(proc.stderr, b"")
 
     def test_help_forms(self):
+        outputs = {}
         for args in ([], ["help"], ["-h"], ["--help"]):
             with self.subTest(args=args):
                 proc = run_cli(args)
                 self.assertEqual(proc.returncode, 0)
                 self.assertEqual(proc.stdout, USAGE.encode())
                 self.assertEqual(proc.stderr, b"")
+                outputs[tuple(args) if args else ("<none>",)] = proc.stdout
+        # All four forms write byte-identical output.
+        self.assertEqual(len(set(outputs.values())), 1)
+
+    def test_help_lists_every_command_once_in_order(self):
+        proc = run_cli(["help"])
+        self.assertEqual(proc.returncode, 0)
+        # Exactly one trailing newline.
+        self.assertTrue(proc.stdout.endswith(b"\n"))
+        self.assertFalse(proc.stdout.endswith(b"\n\n"))
+        text = proc.stdout.decode()
+        lines = text.splitlines()
+        self.assertEqual(
+            lines[0], "usage: python3 -m packet_routing_sim <command>"
+        )
+        # Every command entry, with its argument placeholders, appears exactly
+        # once (description continuation lines never start with a synopsis).
+        entries = [
+            "version",
+            "compute TOPOLOGY.json",
+            "converge TOPOLOGY.json",
+            "replay TOPOLOGY.json SCENARIO.json",
+            "replay-dv TOPOLOGY.json SCENARIO.json",
+            "replay-ls TOPOLOGY.json SCENARIO.json",
+            "help",
+        ]
+        positions = []
+        for entry in entries:
+            matches = [
+                index
+                for index, line in enumerate(lines)
+                if line.strip().startswith(entry)
+            ]
+            self.assertEqual(len(matches), 1, entry)
+            positions.append(matches[0])
+        # Entries stay in the documented order.
+        self.assertEqual(positions, sorted(positions))
+        # The three replay entries state their distinct semantics.
+        self.assertIn("replay the static link-state", text)
+        self.assertIn("failure timeline", text)
+        self.assertIn("show distance-vector failure", text)
+        self.assertIn("convergence round by round", text)
+        self.assertIn("show link-state flooding round by round", text)
+        # The original four descriptions survive verbatim.
+        self.assertIn("print the package version", text)
+        self.assertIn(
+            "compute shortest-path forwarding tables\n"
+            "                                from a static undirected topology",
+            text,
+        )
+        self.assertIn(
+            "show distance-vector convergence round\n"
+            "                                by round from a static "
+            "undirected topology",
+            text,
+        )
+        self.assertIn("help                          print this message", text)
 
     def test_unknown_command(self):
+        # The raw argument text is preserved verbatim, including spaces and
+        # names that merely look like the real commands.
+        for raw in (
+            "frobnicate",
+            "frob nicate",
+            "Replay",
+            "replay-x",
+            "help-me",
+            "--version",
+        ):
+            with self.subTest(command=raw):
+                proc = run_cli([raw])
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, b"")
+                self.assertEqual(
+                    proc.stderr,
+                    f"unknown command: {raw}\n{USAGE}".encode(),
+                )
+        # The one-line report precedes the general help with nothing between.
         proc = run_cli(["frobnicate"])
+        self.assertEqual(
+            proc.stderr, b"unknown command: frobnicate\n" + USAGE.encode()
+        )
+        # Extra arguments after an unknown command change nothing.
+        proc = run_cli(["frobnicate", "extra", "args"])
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(proc.stdout, b"")
         self.assertEqual(
-            proc.stderr, f"unknown command: frobnicate\n{USAGE}".encode()
+            proc.stderr, b"unknown command: frobnicate\n" + USAGE.encode()
         )
 
     def test_argument_count_errors(self):

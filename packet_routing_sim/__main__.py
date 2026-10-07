@@ -41,6 +41,14 @@ commands:
                                 from a static undirected topology
   converge TOPOLOGY.json        show distance-vector convergence round
                                 by round from a static undirected topology
+  replay TOPOLOGY.json SCENARIO.json
+                                replay the static link-state
+                                failure timeline
+  replay-dv TOPOLOGY.json SCENARIO.json
+                                show distance-vector failure
+                                convergence round by round
+  replay-ls TOPOLOGY.json SCENARIO.json
+                                show link-state flooding round by round
   help                          print this message
 """
 
