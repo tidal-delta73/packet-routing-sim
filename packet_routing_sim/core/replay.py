@@ -182,8 +182,9 @@ def _rounds_with_empty_holddowns(rounds, ordered_nodes):
 class DistanceVectorLegacyRunner:
     """The hold-down-free ``replay-dv`` runner; converged vectors carry over."""
 
-    def __init__(self, infinity_metric):
+    def __init__(self, infinity_metric, poison_reverse=False):
         self.infinity_metric = infinity_metric
+        self.poison_reverse = poison_reverse
 
     def baseline(self, topology, state):
         adjacency = state.active_adjacency()
@@ -193,12 +194,15 @@ class DistanceVectorLegacyRunner:
             adjacency,
             state.down_nodes,
             self.infinity_metric,
+            self.poison_reverse,
         )
         return _rounds_payload(rounds), rounds[-1]["routers"]
 
     def step(self, event, state, previous_state, vectors):
         topology = state.topology
         adjacency = state.active_adjacency()
+        # Round zero is the event's immediate invalidation/re-adoption rule;
+        # poison reverse shapes only the synchronous exchanges after it.
         round_zero = distance_vector_failure_round_zero(
             vectors, topology.nodes, adjacency, state.down_nodes
         )
@@ -208,6 +212,7 @@ class DistanceVectorLegacyRunner:
             adjacency,
             state.down_nodes,
             self.infinity_metric,
+            self.poison_reverse,
         )
         return _rounds_payload(rounds), rounds[-1]["routers"]
 
@@ -218,12 +223,16 @@ class DistanceVectorHolddownRunner:
     The fault-free baseline invalidates no finite route, so its rounds are the
     legacy rounds with empty ``holdDowns`` maps.  Each later event builds
     round zero from the previous converged vectors (every timer has expired
-    by convergence) and runs the synchronous hold-down convergence.
+    by convergence) and runs the synchronous hold-down convergence.  With
+    poison reverse enabled the baseline plain rounds and every event's later
+    synchronous exchanges use receiver-specific advertisements, while round
+    zero stays the shared immediate-invalidation rule.
     """
 
-    def __init__(self, infinity_metric, hold_down_rounds):
+    def __init__(self, infinity_metric, hold_down_rounds, poison_reverse=False):
         self.infinity_metric = infinity_metric
         self.hold_down_rounds = hold_down_rounds
+        self.poison_reverse = poison_reverse
 
     def baseline(self, topology, state):
         adjacency = state.active_adjacency()
@@ -233,6 +242,7 @@ class DistanceVectorHolddownRunner:
             adjacency,
             state.down_nodes,
             self.infinity_metric,
+            self.poison_reverse,
         )
         rounds = _rounds_with_empty_holddowns(legacy_rounds, topology.nodes)
         return _rounds_payload(rounds), legacy_rounds[-1]["routers"]
@@ -255,6 +265,7 @@ class DistanceVectorHolddownRunner:
             state.down_nodes,
             self.infinity_metric,
             self.hold_down_rounds,
+            self.poison_reverse,
         )
         return _rounds_payload(rounds), vectors
 
@@ -281,20 +292,28 @@ def link_state_replay(topology, events):
 
 
 def distance_vector_replay(
-    topology, events, infinity_metric, hold_down_rounds=None
+    topology,
+    events,
+    infinity_metric,
+    hold_down_rounds=None,
+    poison_reverse=False,
 ):
     """Distance-vector timeline from validated events.
 
     Omitted ``hold_down_rounds`` (``None``) takes the legacy path; an explicit
     ``0`` disables suppression and shares it byte-for-byte.  A positive value
-    adds the echoed root field and per-round ``holdDowns`` maps.
+    adds the echoed root field and per-round ``holdDowns`` maps.  Poison
+    reverse (``poison_reverse``) is likewise absent from the root document
+    unless explicitly enabled, in which case the root echoes
+    ``poisonReverse: true``; the timeline entry and round shapes are
+    otherwise unchanged.
     """
     if not hold_down_rounds:
         result = {
             "protocol": "distance-vector",
             "infinityMetric": infinity_metric,
         }
-        runner = DistanceVectorLegacyRunner(infinity_metric)
+        runner = DistanceVectorLegacyRunner(infinity_metric, poison_reverse)
     else:
         result = {
             "protocol": "distance-vector",
@@ -302,7 +321,9 @@ def distance_vector_replay(
             "holdDownRounds": hold_down_rounds,
         }
         runner = DistanceVectorHolddownRunner(
-            infinity_metric, hold_down_rounds
+            infinity_metric, hold_down_rounds, poison_reverse
         )
+    if poison_reverse:
+        result["poisonReverse"] = True
     result["timeline"] = run_timeline(topology, events, runner)
     return result

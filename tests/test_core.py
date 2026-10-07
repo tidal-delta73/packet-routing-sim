@@ -1250,13 +1250,19 @@ class TestDistanceVectorReplay(unittest.TestCase):
 
 class TestDistanceVectorReplayValidation(unittest.TestCase):
     def test_validate_dv_scenario_returns_events_and_infinity(self):
-        events, infinity_metric, hold_down_rounds = validate_dv_scenario(
+        (
+            events,
+            infinity_metric,
+            hold_down_rounds,
+            poison_reverse,
+        ) = validate_dv_scenario(
             validate_topology(CHAIN3),
             {"infinityMetric": 8,
              "events": [{"time": 1, "action": "node-down", "node": "C"}]},
         )
         self.assertEqual(infinity_metric, 8)
         self.assertIsNone(hold_down_rounds)
+        self.assertFalse(poison_reverse)
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].node, "C")
 

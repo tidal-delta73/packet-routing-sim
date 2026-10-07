@@ -179,7 +179,8 @@ def replay_dv_validated(topo, scenario):
 
     Mirrors :func:`replay_validated` so the command layer can enforce
     topology-before-scenario precedence; here the scenario must also carry
-    an ``infinityMetric`` and may carry ``holdDownRounds``.
+    an ``infinityMetric`` and may carry ``holdDownRounds`` and the JSON
+    boolean ``poisonReverse``.
 
     Without ``holdDownRounds`` the result is byte-for-byte the legacy
     document::
@@ -193,17 +194,26 @@ def replay_dv_validated(topo, scenario):
         {"protocol": "distance-vector", "infinityMetric": ...,
          "holdDownRounds": ..., "timeline": ...}
 
+    With ``poisonReverse: true`` the root additionally echoes
+    ``poisonReverse: true`` and each synchronous exchange advertises a
+    destination unreachable back to the very neighbor the route was selected
+    through; omitted or false, the document gains no such field and every
+    round takes the legacy path.  The two options combine independently.
+
     Every timeline entry holds its converged synchronous rounds (round 0
     plus each later changed round) and a ``convergenceRound`` pointer, which
     under hold-down points at the last round in which either a forwarding
     vector or a hold-down timer still changed.  The baseline entry has
     ``event: null``; event entries echo ``time`` and the raw event verbatim.
     """
-    events, infinity_metric, hold_down_rounds = validate_dv_scenario(
-        topo, copy.deepcopy(scenario)
-    )
+    (
+        events,
+        infinity_metric,
+        hold_down_rounds,
+        poison_reverse,
+    ) = validate_dv_scenario(topo, copy.deepcopy(scenario))
     return distance_vector_replay(
-        topo, events, infinity_metric, hold_down_rounds
+        topo, events, infinity_metric, hold_down_rounds, poison_reverse
     )
 
 

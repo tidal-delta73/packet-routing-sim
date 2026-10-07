@@ -63,11 +63,11 @@ whole row is unreachable; a recovering router starts knowing only itself and
 its currently available direct neighbors; and both endpoints of a recovered
 link regain the direct route at once. Subsequent rounds read only the
 previous round's advertisements from currently available neighbors, with no
-split horizon or poison reverse. A candidate metric at or above
-`infinityMetric` is reported as `null`/`null`, and ties on finite metric
-break to the smaller next-hop name. The recorded rounds make the rising
-metrics, alternating advertisements and final unreachability fully
-auditable.
+split horizon or poison reverse unless the optional `poisonReverse` mode is
+enabled. A candidate metric at or above `infinityMetric` is reported as
+`null`/`null`, and ties on finite metric break to the smaller next-hop name.
+The recorded rounds make the rising metrics, alternating advertisements and
+final unreachability fully auditable.
 
 The scenario may additionally carry `holdDownRounds`: a non-boolean
 non-negative integer selecting optional route hold-down after the baseline.
@@ -98,6 +98,40 @@ the forwarding tables and the `holdDowns` maps stop changing, and
 the event format, `infinityMetric`, the infinity threshold and the
 smaller-next-hop tie rule are unchanged. `replay`, `replay-ls`, `compute`
 and `converge` ignore `holdDownRounds`.
+
+The scenario may additionally carry `poisonReverse`: a JSON boolean
+selecting receiver-specific poison-reverse advertisements. Omission or
+`false` leaves input, output and behavior byte-for-byte unchanged (the
+result gains no such field); a non-boolean value reports `invalid scenario`
+with exit status 2, again after topology errors. When `true`, the root
+object echoes `poisonReverse: true`; the topology, events, timeline
+entries and forwarding-entry formats are otherwise unchanged.
+
+Each router's local table keeps storing the actually selected next hop and
+metric. Only the advertisements of the synchronous exchanges after round 0
+are generated per receiver: when the sender's current next hop to a
+destination is exactly the receiving neighbor, it advertises that
+destination unreachable to that neighbor alone, while every other neighbor
+still receives the stored metric. The receiver chooses candidates only
+from the advertisements addressed to it in the previous round, adds the
+current direct-link metric, still treats a candidate at or above
+`infinityMetric` as unreachable, and still breaks finite ties to the
+smaller next-hop name. The fault-free baseline begins at the same
+self/direct round 0, and the round 0 immediately after an event keeps its
+existing immediate invalidation, node-recovery initialization and
+link-recovery direct-route rules; poison reverse first takes effect at the
+following synchronous exchange, so a loop that previously counted to
+infinity can be suppressed immediately. Only rounds that change are still
+recorded and `convergenceRound` still points at the stable round. The
+stable tables are the same shortest-path answers as without poison reverse.
+
+`poisonReverse` combines independently with `holdDownRounds`: the
+receiver-specific advertisements of the previous round are obtained first,
+then the existing invalidation decision, timer countdown, immediate timer
+clearing on a direct-link recovery and refusal of finite alternatives while
+suppressed all apply unchanged; the per-round `routers` and `holdDowns`
+structures are unchanged and convergence still requires both to be stable.
+`replay`, `replay-ls`, `compute` and `converge` ignore `poisonReverse`.
 
 `replay-ls` reads the same topology and scenario format but replays the
 link-state protocol itself, exposing neighbor discovery, LSA flooding and
