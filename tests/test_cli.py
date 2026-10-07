@@ -38,12 +38,17 @@ REPLAY_DV_USAGE = (
 USAGE = """usage: python3 -m packet_routing_sim <command>
 
 commands:
-  version                       print the package version
-  compute TOPOLOGY.json         compute shortest-path forwarding tables
-                                from a static undirected topology
-  converge TOPOLOGY.json        show distance-vector convergence round
-                                by round from a static undirected topology
-  help                          print this message
+  version                               print the package version
+  compute TOPOLOGY.json                 compute shortest-path forwarding tables
+                                        from a static undirected topology
+  converge TOPOLOGY.json                show distance-vector convergence round
+                                        by round from a static undirected topology
+  replay TOPOLOGY.json SCENARIO.json    replay the static link-state failure
+                                        timeline from a scenario
+  replay-dv TOPOLOGY.json SCENARIO.json show distance-vector failure
+                                        convergence round by round
+  replay-ls TOPOLOGY.json SCENARIO.json show link-state flooding round by round
+  help                                  print this message
 """
 
 
@@ -1952,12 +1957,88 @@ class TestCLIContract(unittest.TestCase):
         self.assertEqual(proc.stderr, b"")
 
     def test_help_forms(self):
+        # help, no arguments and both short/long flags print the exact same
+        # general help to stdout, nothing to stderr, and finish cleanly.
         for args in ([], ["help"], ["-h"], ["--help"]):
             with self.subTest(args=args):
                 proc = run_cli(args)
                 self.assertEqual(proc.returncode, 0)
                 self.assertEqual(proc.stdout, USAGE.encode())
                 self.assertEqual(proc.stderr, b"")
+
+    def test_help_lists_every_entry_once_with_expected_text(self):
+        # (spec, first description line, wrapped continuation or None).  The
+        # original four entries keep their names, placeholders and wording; the
+        # three replay entry points are inserted between converge and help.
+        entries = [
+            ("version", "print the package version", None),
+            ("compute TOPOLOGY.json",
+             "compute shortest-path forwarding tables",
+             "from a static undirected topology"),
+            ("converge TOPOLOGY.json",
+             "show distance-vector convergence round",
+             "by round from a static undirected topology"),
+            ("replay TOPOLOGY.json SCENARIO.json",
+             "replay the static link-state failure",
+             "timeline from a scenario"),
+            ("replay-dv TOPOLOGY.json SCENARIO.json",
+             "show distance-vector failure",
+             "convergence round by round"),
+            ("replay-ls TOPOLOGY.json SCENARIO.json",
+             "show link-state flooding round by round", None),
+            ("help", "print this message", None),
+        ]
+
+        # The usage header is unchanged and the message ends in one newline.
+        lines = USAGE.split("\n")
+        self.assertEqual(
+            lines[0], "usage: python3 -m packet_routing_sim <command>"
+        )
+        self.assertEqual(lines[-1], "")
+        self.assertFalse(USAGE.endswith("\n\n"))
+
+        # Header rows start with exactly two spaces; each is a left-justified
+        # spec ending in the shared description column, so splitting there
+        # pins every spec once, in the exact required order -- including that
+        # the three replay entries sit between converge and help.
+        description_column = 40
+        header_rows = [
+            line for line in lines
+            if len(line) > 2 and line[0:2] == "  " and line[2] != " "
+        ]
+        parsed = []
+        for line in header_rows:
+            spec_field = line[2:description_column]
+            spec = spec_field.rstrip(" ")
+            self.assertEqual(
+                spec_field, spec.ljust(description_column - 2), line
+            )
+            parsed.append((spec, line[description_column:]))
+        self.assertEqual(
+            parsed, [(spec, desc) for spec, desc, _ in entries]
+        )
+        self.assertEqual(
+            [spec.split()[0] for spec, _ in parsed],
+            ["version", "compute", "converge", "replay", "replay-dv",
+             "replay-ls", "help"],
+        )
+
+        # Wrapped continuation lines reuse the same description column.
+        self.assertEqual(len(header_rows), len(entries))
+        for line, (spec, description, _) in zip(header_rows, entries):
+            self.assertTrue(line[2:].startswith(spec), (line, spec))
+            self.assertEqual(line[description_column:], description, line)
+        continuation_lines = [
+            line for line in lines if line.startswith(" " * description_column)
+        ]
+        self.assertEqual(
+            continuation_lines,
+            [
+                " " * description_column + text
+                for _, _, text in entries
+                if text is not None
+            ],
+        )
 
     def test_unknown_command(self):
         proc = run_cli(["frobnicate"])
@@ -1966,6 +2047,20 @@ class TestCLIContract(unittest.TestCase):
         self.assertEqual(
             proc.stderr, f"unknown command: frobnicate\n{USAGE}".encode()
         )
+
+    def test_unknown_command_keeps_raw_spelling_then_prints_help(self):
+        # The command is echoed verbatim (no case folding or flag handling),
+        # stdout stays empty, and the updated general help follows the single
+        # "unknown command" line on stderr.
+        for raw in ("Nope", "--bogus", "replay_all"):
+            with self.subTest(raw=raw):
+                proc = run_cli([raw])
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, b"")
+                self.assertEqual(
+                    proc.stderr,
+                    f"unknown command: {raw}\n{USAGE}".encode(),
+                )
 
     def test_argument_count_errors(self):
         cases = [

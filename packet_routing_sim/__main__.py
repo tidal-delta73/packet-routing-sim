@@ -36,12 +36,17 @@ REPLAY_LS_USAGE = (
 USAGE = """usage: python3 -m packet_routing_sim <command>
 
 commands:
-  version                       print the package version
-  compute TOPOLOGY.json         compute shortest-path forwarding tables
-                                from a static undirected topology
-  converge TOPOLOGY.json        show distance-vector convergence round
-                                by round from a static undirected topology
-  help                          print this message
+  version                               print the package version
+  compute TOPOLOGY.json                 compute shortest-path forwarding tables
+                                        from a static undirected topology
+  converge TOPOLOGY.json                show distance-vector convergence round
+                                        by round from a static undirected topology
+  replay TOPOLOGY.json SCENARIO.json    replay the static link-state failure
+                                        timeline from a scenario
+  replay-dv TOPOLOGY.json SCENARIO.json show distance-vector failure
+                                        convergence round by round
+  replay-ls TOPOLOGY.json SCENARIO.json show link-state flooding round by round
+  help                                  print this message
 """
 
 
