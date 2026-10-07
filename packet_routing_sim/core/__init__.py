@@ -19,7 +19,9 @@ nodes are sorted by name and every neighbor scan is explicit.
 Inputs are deep-copied on entry and outputs are built fresh, so an input
 object compares equal before and after a call, mutating one call's result
 cannot affect a later call, and no fault state ever leaks between calls --
-every replay starts from the fault-free state.
+every replay starts from the fault-free state.  The three replay timelines
+share the single event boundary in :mod:`packet_routing_sim.core.replay`;
+only their protocol drivers differ.
 
 Invalid input raises a distinguishable error:
 
@@ -36,22 +38,19 @@ from .errors import (
     InvalidTopology,
     SimulationError,
 )
-from .linkstate import (
-    active_neighbor_sets,
-    baseline_databases,
-    changed_endpoints,
-    event_databases,
-    link_state_convergence,
+from .replay import (
+    DistanceVectorProtocol,
+    LinkStateProtocol,
+    StaticLinkStateProtocol,
+    run_timeline,
 )
 from .routing import (
     distance_vector_convergence,
-    distance_vector_failure_convergence,
-    distance_vector_failure_round_zero,
     distance_vector_holddown_convergence,
     distance_vector_holddown_round,
     distance_vector_holddown_round_zero,
     forwarding_table,
-    initial_distance_vectors,
+    holddowns_public,
     link_state_snapshot,
 )
 from .scenario import validate_dv_scenario, validate_scenario
@@ -93,8 +92,9 @@ def _validated(topology):
 def snapshot_state(state):
     """Build one link-state routers snapshot from an explicit network state."""
     ordered_nodes = state.topology.nodes
-    active_adjacency = state.active_adjacency()
-    return link_state_snapshot(ordered_nodes, active_adjacency, state.down_nodes)
+    return link_state_snapshot(
+        ordered_nodes, state.active_adjacency(), state.down_nodes
+    )
 
 
 def compute_topology(topology):
@@ -126,20 +126,7 @@ def replay_validated(topo, scenario):
     Lets a caller (the command layer) enforce topology-before-scenario
     validation precedence.  Only the scenario is validated here.
     """
-    events = validate_scenario(topo, copy.deepcopy(scenario))
-
-    state = NetworkState.initial(topo)
-    timeline = [{"event": None, "routers": snapshot_state(state)}]
-    for event in events:
-        state = apply_event(state, event)
-        timeline.append(
-            {
-                "time": event.time,
-                "event": event.raw,
-                "routers": snapshot_state(state),
-            }
-        )
-    return {"protocol": "link-state", "timeline": timeline}
+    return run_timeline(topo, StaticLinkStateProtocol(), scenario)
 
 
 def replay_scenario(topology, scenario):
@@ -159,76 +146,14 @@ def replay_ls_validated(topo, scenario):
     Mirrors :func:`replay_validated` (topology already validated, only the
     scenario validated here) but replays the protocol itself: every timeline
     entry carries ``rounds`` (each with ``round``, ``databases`` and
-    ``routers``) from round 0 through a flooding fixed point, plus the
-    final ``convergenceRound``.  The baseline entry has ``event: null``;
-    event entries echo ``time`` and the raw event verbatim.
+    ``routers``) from round 0 through a flooding fixed point, plus the final
+    ``convergenceRound``.  The baseline entry has ``event: null``; event
+    entries echo ``time`` and the raw event verbatim.
 
-    Converged databases and per-node sequence history carry from one entry
-    to the next, while every *call* starts from the fault-free state.
+    Converged databases and per-node sequence history carry from one entry to
+    the next, while every *call* starts from the fault-free state.
     """
-    events = validate_scenario(topo, copy.deepcopy(scenario))
-
-    ordered_nodes = topo.nodes
-    state = NetworkState.initial(topo)
-    baseline_neighbors = active_neighbor_sets(
-        ordered_nodes, state.active_adjacency()
-    )
-    databases, sequences = baseline_databases(ordered_nodes, baseline_neighbors)
-    baseline_rounds, databases = link_state_convergence(
-        databases,
-        ordered_nodes,
-        topo,
-        state.active_adjacency(),
-        state.down_nodes,
-    )
-    timeline = [
-        {
-            "event": None,
-            "convergenceRound": baseline_rounds[-1]["round"],
-            "rounds": baseline_rounds,
-        }
-    ]
-
-    for event in events:
-        previous_state = state
-        state = apply_event(state, event)
-        recovered = previous_state.down_nodes - state.down_nodes
-        active_adjacency = state.active_adjacency()
-        new_neighbors = active_neighbor_sets(ordered_nodes, active_adjacency)
-        old_neighbors = active_neighbor_sets(
-            ordered_nodes, previous_state.active_adjacency()
-        )
-        changed = changed_endpoints(
-            ordered_nodes,
-            old_neighbors,
-            new_neighbors,
-            state.down_nodes,
-            recovered,
-        )
-        databases, sequences = event_databases(
-            databases,
-            ordered_nodes,
-            new_neighbors,
-            state.down_nodes,
-            changed,
-            sequences,
-        )
-        rounds, databases = link_state_convergence(
-            databases,
-            ordered_nodes,
-            topo,
-            active_adjacency,
-            state.down_nodes,
-        )
-        timeline.append(
-            {
-                "time": event.time,
-                "event": event.raw,
-                "convergenceRound": rounds[-1]["round"],
-                "rounds": rounds,
-            }
-        )
-    return {"protocol": "link-state", "timeline": timeline}
+    return run_timeline(topo, LinkStateProtocol(), scenario)
 
 
 def replay_ls_scenario(topology, scenario):
@@ -245,8 +170,8 @@ def replay_dv_validated(topo, scenario):
     """Distance-vector failure timeline from an already-validated topology.
 
     Mirrors :func:`replay_validated` so the command layer can enforce
-    topology-before-scenario precedence; here the scenario must also carry
-    an ``infinityMetric`` and may carry ``holdDownRounds``.
+    topology-before-scenario precedence; here the scenario must also carry an
+    ``infinityMetric`` and may carry ``holdDownRounds``.
 
     Without ``holdDownRounds`` the result is byte-for-byte the legacy
     document::
@@ -260,164 +185,19 @@ def replay_dv_validated(topo, scenario):
         {"protocol": "distance-vector", "infinityMetric": ...,
          "holdDownRounds": ..., "timeline": ...}
 
-    Every timeline entry holds its converged synchronous rounds (round 0
-    plus each later changed round) and a ``convergenceRound`` pointer, which
-    under hold-down points at the last round in which either a forwarding
-    vector or a hold-down timer still changed.  The baseline entry has
-    ``event: null``; event entries echo ``time`` and the raw event verbatim.
+    Every timeline entry holds its converged synchronous rounds (round 0 plus
+    each later changed round) and a ``convergenceRound`` pointer, which under
+    hold-down points at the last round in which either a forwarding vector or
+    a hold-down timer still changed.  The baseline entry has ``event: null``;
+    event entries echo ``time`` and the raw event verbatim.
     """
-    events, infinity_metric, hold_down_rounds = validate_dv_scenario(
-        topo, copy.deepcopy(scenario)
-    )
-
-    ordered_nodes = topo.nodes
-    state = NetworkState.initial(topo)
-    baseline_adjacency = state.active_adjacency()
-    baseline_rounds = distance_vector_failure_convergence(
-        initial_distance_vectors(ordered_nodes, baseline_adjacency),
-        ordered_nodes,
-        baseline_adjacency,
-        state.down_nodes,
-        infinity_metric,
-    )
-
-    if not hold_down_rounds:
-        # Omission preserves the legacy result; an explicit 0 is defined to
-        # disable suppression entirely, so it shares the identical path.
-        return _replay_dv_legacy(
-            topo, events, ordered_nodes, infinity_metric, baseline_rounds, state
-        )
-    return _replay_dv_holddown(
-        topo,
-        events,
-        ordered_nodes,
-        infinity_metric,
-        hold_down_rounds,
-        baseline_rounds,
-        state,
-    )
-
-
-def _replay_dv_legacy(
-    topo, events, ordered_nodes, infinity_metric, baseline_rounds, state
-):
-    """The original hold-down-free replay, unchanged in every byte."""
-    timeline = [
-        {
-            "event": None,
-            "convergenceRound": baseline_rounds[-1]["round"],
-            "rounds": baseline_rounds,
-        }
-    ]
-
-    vectors = baseline_rounds[-1]["routers"]
-    for event in events:
-        state = apply_event(state, event)
-        active_adjacency = state.active_adjacency()
-        round_zero = distance_vector_failure_round_zero(
-            vectors, ordered_nodes, active_adjacency, state.down_nodes
-        )
-        rounds = distance_vector_failure_convergence(
-            round_zero,
-            ordered_nodes,
-            active_adjacency,
-            state.down_nodes,
-            infinity_metric,
-        )
-        vectors = rounds[-1]["routers"]
-        timeline.append(
-            {
-                "time": event.time,
-                "event": event.raw,
-                "convergenceRound": rounds[-1]["round"],
-                "rounds": rounds,
-            }
-        )
-    return {
-        "protocol": "distance-vector",
-        "infinityMetric": infinity_metric,
-        "timeline": timeline,
-    }
-
-
-def _rounds_with_empty_holddowns(rounds, ordered_nodes):
-    """Fresh copy of legacy-style rounds carrying an empty ``holdDowns`` map."""
-    empty = {router: {} for router in ordered_nodes}
-    return [
-        {
-            "round": snapshot["round"],
-            "routers": snapshot["routers"],
-            "holdDowns": {router: dict(empty[router]) for router in ordered_nodes},
-        }
-        for snapshot in rounds
-    ]
-
-
-def _replay_dv_holddown(
-    topo,
-    events,
-    ordered_nodes,
-    infinity_metric,
-    hold_down_rounds,
-    baseline_rounds,
-    state,
-):
-    """Replay in which failure-invalidated routes are held down briefly.
-
-    The fault-free baseline never invalidates a finite route, so its rounds
-    carry empty hold-down maps and exactly the legacy forwarding vectors.
-    Each event after the baseline builds its round zero from the previous
-    converged vectors (whose hold-down timers have all expired by then) and
-    runs the synchronous hold-down convergence.
-    """
-    timeline = [
-        {
-            "event": None,
-            "convergenceRound": baseline_rounds[-1]["round"],
-            "rounds": _rounds_with_empty_holddowns(baseline_rounds, ordered_nodes),
-        }
-    ]
-
-    vectors = baseline_rounds[-1]["routers"]
-    for event in events:
-        state = apply_event(state, event)
-        active_adjacency = state.active_adjacency()
-        round_zero, holddowns_zero = distance_vector_holddown_round_zero(
-            vectors,
-            ordered_nodes,
-            active_adjacency,
-            state.down_nodes,
-            hold_down_rounds,
-        )
-        rounds, vectors = distance_vector_holddown_convergence(
-            round_zero,
-            holddowns_zero,
-            ordered_nodes,
-            active_adjacency,
-            state.down_nodes,
-            infinity_metric,
-            hold_down_rounds,
-        )
-        timeline.append(
-            {
-                "time": event.time,
-                "event": event.raw,
-                "convergenceRound": rounds[-1]["round"],
-                "rounds": rounds,
-            }
-        )
-    return {
-        "protocol": "distance-vector",
-        "infinityMetric": infinity_metric,
-        "holdDownRounds": hold_down_rounds,
-        "timeline": timeline,
-    }
+    return run_timeline(topo, DistanceVectorProtocol(), scenario)
 
 
 def replay_dv_scenario(topology, scenario):
     """Distance-vector failure timeline for a decoded topology and scenario.
 
-    Like :func:`replay_scenario`, every call starts from the fault-free
-    state and neither reads nor retains state from a previous call.
+    Like :func:`replay_scenario`, every call starts from the fault-free state
+    and neither reads nor retains state from a previous call.
     """
     return replay_dv_validated(_validated(topology), scenario)
