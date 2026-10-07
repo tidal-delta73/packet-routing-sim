@@ -26,7 +26,11 @@ exactly once.  The modes keep only what is genuinely their own:
   ``infinityMetric``;
 * hold-down ``replay-dv`` adds its transitive round-zero invalidation, the
   per-destination suppression countdown and immediate direct-recovery
-  clearing around the very same selection kernel.
+  clearing around the very same selection kernel;
+* optional poison reverse changes none of the above decisions: it only
+  changes which previous-round metric a neighbor is read as having
+  advertised to the particular receiver, by poisoning the destination back
+  at the neighbor that is the reader's own selected next hop.
 """
 import heapq
 
@@ -123,7 +127,8 @@ def _unreachable_row(ordered_nodes):
 
 
 def _best_neighbor_route(
-    router, destination, previous, adjacency, infinity_metric
+    router, destination, previous, adjacency, infinity_metric,
+    advertised_metric=None,
 ):
     """Select ``(next_hop, metric)`` for one online router/destination.
 
@@ -133,11 +138,19 @@ def _best_neighbor_route(
     ``infinity_metric`` of ``None`` disables the threshold; otherwise a
     candidate at or above it is treated as unreachable.  Returns
     ``(None, None)`` when no finite, below-infinity candidate exists.
+
+    ``advertised_metric`` optionally overrides the metric read for the
+    scanned neighbor: the poison-reverse path passes a callable returning the
+    metric that neighbor was *specifically sent* on the previous round
+    (``None`` when that advertisement poisoned this destination).
     """
     best_metric = None
     best_hop = None
     for neighbor in sorted(adjacency[router]):
-        advertised = previous[neighbor][destination]["metric"]
+        if advertised_metric is None:
+            advertised = previous[neighbor][destination]["metric"]
+        else:
+            advertised = advertised_metric(neighbor, destination)
         if advertised is None:
             continue
         candidate = adjacency[router][neighbor] + advertised
@@ -153,21 +166,52 @@ def _best_neighbor_route(
     return best_hop, best_metric
 
 
+def _receiver_specific_advertisement(previous, receiver, poison_reverse):
+    """Read a neighbor's previous metric as it was advertised to ``receiver``.
+
+    Return a ``(neighbor, destination) -> metric`` lookup for the shared
+    selection kernel, or ``None`` when every neighbor advertises its own
+    selected metric to everyone.  With poison reverse a neighbor poisons
+    (advertises ``null``) a destination for which ``receiver`` itself is its
+    selected next hop.
+    """
+    if not poison_reverse:
+        return None
+
+    def advertised(neighbor, destination):
+        entry = previous[neighbor][destination]
+        if entry["nextHop"] == receiver:
+            return None
+        return entry["metric"]
+
+    return advertised
+
+
 def _distance_vector_round(
-    previous, ordered_nodes, adjacency, down_nodes, infinity_metric
+    previous,
+    ordered_nodes,
+    adjacency,
+    down_nodes,
+    infinity_metric,
+    poison_reverse=False,
 ):
     """Synchronously update every router via the shared selection kernel.
 
     Each online router recomputes every destination from its neighbors'
     previous-round advertisements with the infinity cutoff and tie rule of
-    :func:`_best_neighbor_route`.  A down router keeps an entirely
-    unreachable row.
+    :func:`_best_neighbor_route`.  With poison reverse each neighbor is read
+    through its own receiver-specific advertisement (a route whose selected
+    next hop is this router is poisoned back to it).  A down router keeps an
+    entirely unreachable row.
     """
     current = {}
     for router in ordered_nodes:
         if router in down_nodes:
             current[router] = _unreachable_row(ordered_nodes)
             continue
+        advertised_metric = _receiver_specific_advertisement(
+            previous, router, poison_reverse
+        )
         table = {}
         for destination in ordered_nodes:
             if destination == router:
@@ -179,6 +223,7 @@ def _distance_vector_round(
                 previous,
                 adjacency,
                 infinity_metric,
+                advertised_metric,
             )
             table[destination] = {"nextHop": hop, "metric": metric}
         current[router] = table
@@ -197,18 +242,31 @@ def distance_vector_round(previous, ordered_nodes, adjacency):
 
 
 def distance_vector_round_infinity(
-    previous, ordered_nodes, adjacency, down_nodes, infinity_metric
+    previous,
+    ordered_nodes,
+    adjacency,
+    down_nodes,
+    infinity_metric,
+    poison_reverse=False,
 ):
     """Synchronously update from prior ads with an infinity threshold.
 
-    Same scan/tie rules as :func:`distance_vector_round`, with no split
-    horizon or poison reverse: every available neighbor's previous-round
-    advertisement is read.  A candidate metric at or above
-    ``infinity_metric`` counts as unreachable.  Down routers keep an
-    entirely unreachable row.
+    Same scan/tie rules as :func:`distance_vector_round`; without poison
+    reverse every available neighbor's previous-round advertisement is read.
+    With poison reverse a neighbor's advertisement is read as it was
+    specifically generated for the receiver: a destination for which the
+    receiver itself is the sender's selected next hop arrives as
+    unreachable, while the sender's ordinary metric still reaches every
+    other neighbor.  A candidate metric at or above ``infinity_metric``
+    counts as unreachable.  Down routers keep an entirely unreachable row.
     """
     return _distance_vector_round(
-        previous, ordered_nodes, adjacency, down_nodes, infinity_metric
+        previous,
+        ordered_nodes,
+        adjacency,
+        down_nodes,
+        infinity_metric,
+        poison_reverse,
     )
 
 
@@ -308,14 +366,23 @@ def distance_vector_failure_round_zero(
 
 
 def distance_vector_failure_convergence(
-    round_zero, ordered_nodes, active_adjacency, down_nodes, infinity_metric
+    round_zero,
+    ordered_nodes,
+    active_adjacency,
+    down_nodes,
+    infinity_metric,
+    poison_reverse=False,
 ):
     """Record round 0 and every later changed round up to a fixed point.
 
     After a cost increase a stale route's metric rises by at least the link
     cost along its dependency cycle until it reaches the threshold and is
     flushed as unreachable (the count-to-infinity process), so the scan
-    always terminates; a surviving finite alternative wins earlier.
+    always terminates; a surviving finite alternative wins earlier.  With
+    poison reverse each synchronous exchange is generated per receiver, so
+    a router never reads back a route through a hop that itself routes that
+    destination via the router; the process then converges directly instead
+    of counting to infinity.
     """
     return _record_vector_rounds(
         round_zero,
@@ -325,6 +392,7 @@ def distance_vector_failure_convergence(
             active_adjacency,
             down_nodes,
             infinity_metric,
+            poison_reverse,
         ),
     )
 
@@ -458,18 +526,28 @@ def distance_vector_holddown_round_zero(
 
 
 def _selected_hop_usable(
-    router, destination, hop, previous, adjacency, infinity_metric
+    router,
+    destination,
+    hop,
+    previous,
+    adjacency,
+    infinity_metric,
+    advertised_metric=None,
 ):
     """Whether the route currently selected via ``hop`` stays finite.
 
     The same usability test the shared selection kernel applies to that
     hop's own previous-round advertisement: a present neighbor advertising
-    unreachable, or a total metric at/above the infinity threshold, no longer
-    carries the route.
+    unreachable -- including a poison-reverse advertisement generated
+    specifically for this receiver -- or a total metric at/above the
+    infinity threshold, no longer carries the route.
     """
     if hop not in adjacency[router]:
         return False
-    advertised = previous[hop][destination]["metric"]
+    if advertised_metric is None:
+        advertised = previous[hop][destination]["metric"]
+    else:
+        advertised = advertised_metric(hop, destination)
     if advertised is None:
         return False
     return adjacency[router][hop] + advertised < infinity_metric
@@ -483,6 +561,7 @@ def distance_vector_holddown_round(
     infinity_metric,
     holddowns,
     hold_down,
+    poison_reverse=False,
 ):
     """One synchronous round with hold-down suppression.
 
@@ -500,7 +579,12 @@ def distance_vector_holddown_round(
       smaller-next-hop tie rule unchanged.
 
     A destination that is currently directly reachable is always adopted at
-    its direct metric and clears any timer at once.
+    its direct metric and clears any timer at once.  With poison reverse the
+    invalidation test and the best-neighbor scan both read each neighbor's
+    previous-round advertisement as it was generated for this receiver: the
+    selected hop poisons the destination back when this router is itself the
+    hop's selected next hop, so the very first exchange treats the stale
+    route as unusable.
     """
     current = {}
     next_holddowns = _empty_holddowns(ordered_nodes)
@@ -508,6 +592,9 @@ def distance_vector_holddown_round(
         if router in down_nodes:
             current[router] = _unreachable_row(ordered_nodes)
             continue
+        advertised_metric = _receiver_specific_advertisement(
+            previous, router, poison_reverse
+        )
         row = {}
         for destination in ordered_nodes:
             if destination == router:
@@ -534,6 +621,7 @@ def distance_vector_holddown_round(
                     previous,
                     adjacency,
                     infinity_metric,
+                    advertised_metric,
                 )
             )
 
@@ -558,6 +646,7 @@ def distance_vector_holddown_round(
                 previous,
                 adjacency,
                 infinity_metric,
+                advertised_metric,
             )
             row[destination] = {"nextHop": hop, "metric": metric}
         current[router] = row
@@ -609,6 +698,7 @@ def distance_vector_holddown_convergence(
     down_nodes,
     infinity_metric,
     hold_down,
+    poison_reverse=False,
 ):
     """Record rounds under hold-down until vectors and timers are both stable.
 
@@ -616,7 +706,8 @@ def distance_vector_holddown_convergence(
     hold-down update.  A round is recorded while either the forwarding
     vectors or the published hold-down map still change, so
     ``convergenceRound`` points at the last round that is not yet a fixed
-    point under both.  Returns ``(rounds, final_vectors)``.
+    point under both.  With poison reverse the synchronous updates read
+    receiver-specific advertisements.  Returns ``(rounds, final_vectors)``.
     """
     return _record_holddown_rounds(
         round_zero,
@@ -630,5 +721,6 @@ def distance_vector_holddown_convergence(
             infinity_metric,
             timers,
             hold_down,
+            poison_reverse,
         ),
     )

@@ -48,8 +48,12 @@ def validate_dv_scenario(topology, scenario):
     than every declared link metric.  It may optionally carry
     ``holdDownRounds``: a non-boolean non-negative integer selecting route
     hold-down after failure events; omission (``None``) preserves the legacy
-    behavior byte-for-byte, while ``0`` explicitly disables suppression.
-    Return ``(events, infinity_metric, hold_down_rounds)``.
+    behavior byte-for-byte, while ``0`` explicitly disables suppression.  It
+    may also optionally carry ``poisonReverse``: a JSON boolean selecting
+    receiver-specific poison-reverse advertisements for the synchronous
+    exchanges; omission or ``false`` preserves the legacy path, while a
+    non-boolean value is invalid.  Return
+    ``(events, infinity_metric, hold_down_rounds, poison_reverse)``.
     """
     if not isinstance(scenario, dict):
         raise InvalidScenario("scenario must be an object")
@@ -71,7 +75,18 @@ def validate_dv_scenario(topology, scenario):
             )
     else:
         hold_down_rounds = None
-    return _validate_events(topology, scenario), infinity_metric, hold_down_rounds
+    if "poisonReverse" in scenario:
+        poison_reverse = scenario["poisonReverse"]
+        if not isinstance(poison_reverse, bool):
+            raise InvalidScenario("poisonReverse must be a boolean")
+    else:
+        poison_reverse = False
+    return (
+        _validate_events(topology, scenario),
+        infinity_metric,
+        hold_down_rounds,
+        poison_reverse,
+    )
 
 
 def _validate_events(topology, scenario):

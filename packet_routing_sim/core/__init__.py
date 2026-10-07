@@ -193,17 +193,30 @@ def replay_dv_validated(topo, scenario):
         {"protocol": "distance-vector", "infinityMetric": ...,
          "holdDownRounds": ..., "timeline": ...}
 
+    A boolean ``poisonReverse`` selects receiver-specific poison-reverse
+    advertisements for every synchronous exchange; omitted or false the path
+    and document are byte-for-byte the legacy ones, while true echoes
+    ``poisonReverse: true`` at the root (ahead of ``timeline``).  It combines
+    freely with ``holdDownRounds``; every other entry point ignores it.
+
     Every timeline entry holds its converged synchronous rounds (round 0
     plus each later changed round) and a ``convergenceRound`` pointer, which
     under hold-down points at the last round in which either a forwarding
     vector or a hold-down timer still changed.  The baseline entry has
     ``event: null``; event entries echo ``time`` and the raw event verbatim.
     """
-    events, infinity_metric, hold_down_rounds = validate_dv_scenario(
-        topo, copy.deepcopy(scenario)
-    )
+    (
+        events,
+        infinity_metric,
+        hold_down_rounds,
+        poison_reverse,
+    ) = validate_dv_scenario(topo, copy.deepcopy(scenario))
     return distance_vector_replay(
-        topo, events, infinity_metric, hold_down_rounds
+        topo,
+        events,
+        infinity_metric,
+        hold_down_rounds,
+        poison_reverse,
     )
 
 
